@@ -18,30 +18,30 @@
 
 
 """
-Локальный MTProto-мост.
+Local MTProto bridge.
 
-Поднимает SOCKS5-сервер на 127.0.0.1:<port> и прозрачно туннелирует
-байты между клиентом (Kurigram) и Telegram через MTProto-proxy
-(FakeTLS или obfuscated2).
+Starts a SOCKS5 server on 127.0.0.1:<port> and transparently tunnels
+bytes between the client (Kurigram) and Telegram via an MTProto proxy
+(FakeTLS or obfuscated2).
 
-Транспортный framing определяется типом секрета (как в TDesktop
+Transport framing is determined by the secret type (mirrors TDesktop
 ``TcpConnection::Protocol::Create``):
 
-   - 0xEE + 16 байт + domain  → FakeTLS + padded    (0xDDDDDDDD)
-   - 0xDD + 16 байт           → obfuscated2 + padded (0xDDDDDDDD)
-   - голые 16 байт            → obfuscated2 + abridged (0xEFEFEFEF)
+   - 0xEE + 16 bytes + domain → FakeTLS + padded        (0xDDDDDDDD)
+   - 0xDD + 16 bytes          → obfuscated2 + padded    (0xDDDDDDDD)
+   - bare 16 bytes            → obfuscated2 + abridged  (0xEFEFEFEF)
 
-Мост НЕ транслирует framing: клиент обязан использовать транспорт,
-соответствующий секрету (``TCPPadded`` для ee/dd, ``TCPAbridged``
-для bare 16-байтных). После handshake байты релеятся end-to-end as-is.
+The bridge does NOT translate framing: the client must use the transport
+matching the secret (``TCPPadded`` for ee/dd, ``TCPAbridged`` for bare
+16-byte secrets). After the handshake, bytes are relayed end-to-end as-is.
 
-Ключевые особенности:
-    - server_initial_appdata (noise из FakeTLS handshake) отбрасывается;
-    - transport-тег для obfuscated2 берётся из секрета;
-    - CCS (``kClientPrefix``) отправляется по умолчанию;
-    - инкрементальный парсер ServerHello и TLS Application Data;
-    - activity timeout 30 мин;
-    - reverse-mapping IP → DC ID по встроенной таблице (kBuiltInDcs +
+Key features:
+    - server_initial_appdata (FakeTLS handshake noise) is discarded;
+    - the transport tag for obfuscated2 is taken from the secret;
+    - CCS (``kClientPrefix``) is sent by default;
+    - incremental parser for ServerHello and TLS Application Data;
+    - 30-minute activity timeout;
+    - reverse IP → DC ID mapping via a built-in table (kBuiltInDcs +
       getConfig snapshot).
 """
 
@@ -73,7 +73,7 @@ try:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 except ImportError as e:
     raise SystemExit(
-        "Нужен пакет 'cryptography' (pip install cryptography)"
+        "Required package 'cryptography' is missing (pip install cryptography)"
     ) from e
 
 # ============================================================================
@@ -113,11 +113,11 @@ def _apply_tcp_tuning(writer: asyncio.StreamWriter, peer_label: object) -> None:
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError as e:
-        log.warning(f"[client {peer_label}] TCP_NODELAY не установлен: {e}")
+        log.warning(f"[client {peer_label}] TCP_NODELAY not set: {e}")
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except OSError as e:
-        log.debug(f"[client {peer_label}] SO_KEEPALIVE не установлен: {e}")
+        log.debug(f"[client {peer_label}] SO_KEEPALIVE not set: {e}")
         return
     for opt_name, value in (
         ("TCP_KEEPIDLE", _TCP_KEEPALIVE_TIME),
@@ -130,7 +130,7 @@ def _apply_tcp_tuning(writer: asyncio.StreamWriter, peer_label: object) -> None:
         try:
             sock.setsockopt(socket.IPPROTO_TCP, opt, value)
         except OSError as e:
-            log.debug(f"[client {peer_label}] {opt_name}={value} не установлен: {e}")
+            log.debug(f"[client {peer_label}] {opt_name}={value} not set: {e}")
 
 
 # ============================================================================
@@ -153,7 +153,7 @@ TAG_PADDED_INTERMEDIATE = b"\xdd\xdd\xdd\xdd"
 
 
 class ProxyLink(NamedTuple):
-    """Распарсенная MTProto-ссылка."""
+    """Parsed MTProto link."""
 
     server: str
     port: int
@@ -164,17 +164,17 @@ class ProxyLink(NamedTuple):
 
 
 def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
-    """Парсит MTProto-секрет в hex или base64url.
+    """Parse an MTProto secret in hex or base64url form.
 
     Returns:
-        Кортеж ``(key, domain, is_fake_tls, expected_transport_tag)``:
-            - bare 16 байт        → (raw, "", False, TAG_ABRIDGED)
+        Tuple ``(key, domain, is_fake_tls, expected_transport_tag)``:
+            - bare 16 bytes       → (raw, "", False, TAG_ABRIDGED)
             - 0xEE + 16 + domain  → (raw[1:17], domain, True, TAG_PADDED_INTERMEDIATE)
             - 0xDD + 16           → (raw[1:17], "", False, TAG_PADDED_INTERMEDIATE)
 
     Raises:
-        ValueError: пустой секрет, нераспознанный формат или слишком
-            короткий typed-секрет.
+        ValueError: empty secret, unrecognized format, or a typed secret
+            that is too short.
     """
     s = secret_str.strip()
     if all(c in "0123456789abcdefABCDEF" for c in s) and len(s) % 2 == 0:
@@ -185,15 +185,15 @@ def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
         raw = base64.b64decode(b64)
 
     if not raw:
-        raise ValueError("Пустой секрет")
+        raise ValueError("Empty secret")
 
     if len(raw) == 16:
         return raw, "", False, TAG_ABRIDGED
     if raw[0] == 0xEE:
         if len(raw) < 17:
             raise ValueError(
-                f"FakeTLS-секрет короче 17 байт (len={len(raw)}); "
-                f"если это bare-секрет, он должен быть ровно 16 байт"
+                f"FakeTLS secret shorter than 17 bytes (len={len(raw)}); "
+                f"if this is a bare secret, it must be exactly 16 bytes"
             )
         return (
             raw[1:17],
@@ -204,27 +204,27 @@ def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
     if raw[0] == 0xDD:
         if len(raw) < 17:
             raise ValueError(
-                f"dd-секрет короче 17 байт (len={len(raw)}); "
-                f"если это bare-секрет, он должен быть ровно 16 байт"
+                f"dd-secret shorter than 17 bytes (len={len(raw)}); "
+                f"if this is a bare secret, it must be exactly 16 bytes"
             )
         return raw[1:17], "", False, TAG_PADDED_INTERMEDIATE
     raise ValueError(
-        f"Не распознан формат секрета (первый байт=0x{raw[0]:02x}, len={len(raw)}); "
-        f"ожидается 16 байт (bare) либо 0xDD/0xEE + 16 байт (typed)"
+        f"Unrecognized secret format (first byte=0x{raw[0]:02x}, len={len(raw)}); "
+        f"expected 16 bytes (bare) or 0xDD/0xEE + 16 bytes (typed)"
     )
 
 
 def parse_tg_link(link: str) -> ProxyLink:
-    """Парсит ``tg://proxy?server=...&port=...&secret=...`` в :class:`ProxyLink`.
+    """Parse ``tg://proxy?server=...&port=...&secret=...`` into a :class:`ProxyLink`.
 
     Raises:
-        ValueError: отсутствуют обязательные параметры server/port/secret.
+        ValueError: required parameters server/port/secret are missing.
     """
     parsed = urlparse(link)
     params = parse_qs(parsed.query)
 
     if not params.get("server") or not params.get("port") or not params.get("secret"):
-        raise ValueError("Некорректная ссылка: отсутствуют server, port или secret")
+        raise ValueError("Invalid link: server, port or secret is missing")
 
     server = params["server"][0]
     port = int(params["port"][0])
@@ -657,7 +657,7 @@ def _prepare_client_hello(
     part.finalize(key)
     data = part.take()
     if not data:
-        raise ValueError("Не удалось сгенерировать ClientHello")
+        raise ValueError("Failed to generate ClientHello")
     return ClientHello(data=data, digest=part.extract_digest())
 
 
@@ -683,18 +683,18 @@ async def _read_exactly_logged(
         data = await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
     except asyncio.TimeoutError:
         log.error(
-            f"  [handshake] Таймаут при чтении {what} (нужно {n} байт, {timeout}s)"
+            f"  [handshake] Timeout reading {what} (need {n} bytes, {timeout}s)"
         )
-        raise ConnectionError(f"Таймаут при чтении {what}")
+        raise ConnectionError(f"Timeout reading {what}")
     except asyncio.IncompleteReadError as e:
         log.error(
-            f"  [handshake] Соединение закрыто при чтении {what}: "
-            f"получено {len(e.partial)}/{n} байт"
+            f"  [handshake] Connection closed while reading {what}: "
+            f"got {len(e.partial)}/{n} bytes"
         )
         raise ConnectionError(
-            f"Соединение закрыто при чтении {what}: {len(e.partial)}/{n}"
+            f"Connection closed while reading {what}: {len(e.partial)}/{n}"
         )
-    log.debug(f"  [handshake] Прочитано {n} байт для '{what}': {_hex(data)}")
+    log.debug(f"  [handshake] Read {n} bytes for '{what}': {_hex(data)}")
     return data
 
 
@@ -722,111 +722,111 @@ async def async_faketls_handshake(
         ConnectionError: любая ошибка handshake (неверный формат ответа,
             несовпадение HMAC, таймаут).
     """
-    log.info(f"  [handshake] Начало FakeTLS handshake, domain='{domain}'")
+    log.info(f"  [handshake] FakeTLS handshake starting, domain='{domain}'")
 
     # Шаг 1: ClientHello
     hello = _prepare_client_hello(domain.encode("ascii", errors="replace"), secret_key)
-    log.info(f"  [handshake] ClientHello сгенерирован: {len(hello.data)} байт")
-    log.debug(f"  [handshake] ClientHello первые 32 байта: {_hex(hello.data, 32)}")
+    log.debug(f"  [handshake] ClientHello generated: {len(hello.data)} bytes")
+    log.debug(f"  [handshake] ClientHello first 32 bytes: {_hex(hello.data, 32)}")
     log.debug(f"  [handshake] ClientHello digest: {_hex(hello.digest, 32)}")
 
     writer.write(hello.data)
     await writer.drain()
-    log.info("  [handshake] ClientHello отправлен")
+    log.debug("  [handshake] ClientHello sent")
 
     # Шаг 2: ServerHello record header (5 байт)
-    log.info("  [handshake] Ожидание ServerHello record header (5 байт)...")
+    log.debug("  [handshake] Waiting for ServerHello record header (5 bytes)...")
     hdr = await _read_exactly_logged(reader, 5, "ServerHello record header")
 
     if hdr[0:3] != _SERVER_HELLO_PART1:
         log.error(
-            f"  [handshake] Ожидался 16 03 03, получено {hdr[0:3].hex()} — "
-            f"похоже на fallback-сайт (прокси не распознал секрет)"
+            f"  [handshake] Expected 16 03 03, got {hdr[0:3].hex()} — "
+            f"looks like a fallback site (proxy did not recognize the secret)"
         )
         raise ConnectionError(
-            f"Ответ сервера — не TLS handshake record (ожидался 16 03 03, "
-            f"получено {hdr[0:3].hex()}). Прокси не распознал секрет?"
+            f"Server response is not a TLS handshake record (expected 16 03 03, "
+            f"got {hdr[0:3].hex()}). Proxy did not recognize the secret?"
         )
 
     sh_body_len = struct.unpack(">H", hdr[3:5])[0]
-    log.info(f"  [handshake] ServerHello record header OK, body length={sh_body_len}")
+    log.debug(f"  [handshake] ServerHello record header OK, body length={sh_body_len}")
 
     # parts123Size = 5 + L1 + 9 + 2 = 16 + L1; проверка > kMaxServerHelloLength.
     if sh_body_len <= 0 or sh_body_len > _MAX_SERVER_HELLO_LENGTH - 16:
-        log.error(f"  [handshake] Некорректная длина ServerHello body: {sh_body_len}")
-        raise ConnectionError(f"Некорректная длина ServerHello body: {sh_body_len}")
+        log.error(f"  [handshake] Invalid ServerHello body length: {sh_body_len}")
+        raise ConnectionError(f"Invalid ServerHello body length: {sh_body_len}")
 
     # Шаг 3: ServerHello body
-    log.info(f"  [handshake] Ожидание ServerHello body ({sh_body_len} байт)...")
+    log.debug(f"  [handshake] Waiting for ServerHello body ({sh_body_len} bytes)...")
     sh_body = await _read_exactly_logged(reader, sh_body_len, "ServerHello body")
 
     if not sh_body or sh_body[0] != 0x02:
         log.error(
-            f"  [handshake] ServerHello body не начинается с 0x02: "
+            f"  [handshake] ServerHello body does not start with 0x02: "
             f"{sh_body[0] if sh_body else 'empty'}"
         )
-        raise ConnectionError("ServerHello body не начинается с 0x02 (не ServerHello)")
-    log.info("  [handshake] ServerHello body OK (тип=0x02)")
+        raise ConnectionError("ServerHello body does not start with 0x02 (not a ServerHello)")
+    log.debug("  [handshake] ServerHello body OK (type=0x02)")
 
     # Шаг 4: CCS + начало AppData (kServerHelloPart3, 9 байт) + 2 байта длины
-    log.info("  [handshake] Ожидание CCS+AppData header (kServerHelloPart3, 9 байт)...")
+    log.debug("  [handshake] Waiting for CCS+AppData header (kServerHelloPart3, 9 bytes)...")
     ccs_appdata_prefix = await _read_exactly_logged(
         reader, len(_SERVER_HELLO_PART3), "CCS+AppData header"
     )
     if ccs_appdata_prefix != _SERVER_HELLO_PART3:
         log.error(
-            f"  [handshake] Не найден CCS+AppData header (kServerHelloPart3), "
-            f"получено {_hex(ccs_appdata_prefix)}"
+            f"  [handshake] CCS+AppData header (kServerHelloPart3) not found, "
+            f"got {_hex(ccs_appdata_prefix)}"
         )
         raise ConnectionError(
-            f"Не найден CCS+AppData header (ожидался {_SERVER_HELLO_PART3.hex()}, "
-            f"получено {ccs_appdata_prefix.hex()})"
+            f"CCS+AppData header not found (expected {_SERVER_HELLO_PART3.hex()}, "
+            f"got {ccs_appdata_prefix.hex()})"
         )
-    log.info("  [handshake] CCS+AppData header OK (kServerHelloPart3)")
+    log.debug("  [handshake] CCS+AppData header OK (kServerHelloPart3)")
 
     remaining_len_bytes = await _read_exactly_logged(reader, 2, "AppData length")
     appdata_body_len = struct.unpack(">H", remaining_len_bytes)[0]
-    log.info(f"  [handshake] AppData body length={appdata_body_len}")
+    log.debug(f"  [handshake] AppData body length={appdata_body_len}")
 
     # full = parts123Size + part4Size = (16 + L1) + (2 + L2) ≤ 65536.
     full_size = 16 + sh_body_len + 2 + appdata_body_len
     if full_size > _MAX_SERVER_HELLO_LENGTH:
         log.error(
-            f"  [handshake] Суммарный размер ServerHello {full_size} > "
+            f"  [handshake] Total ServerHello size {full_size} > "
             f"{_MAX_SERVER_HELLO_LENGTH} (L1={sh_body_len}, L2={appdata_body_len})"
         )
         raise ConnectionError(
-            f"ServerHello слишком большой: {full_size} > {_MAX_SERVER_HELLO_LENGTH}"
+            f"ServerHello too large: {full_size} > {_MAX_SERVER_HELLO_LENGTH}"
         )
 
     # Шаг 5: AppData body
     if appdata_body_len > 0:
-        log.info(f"  [handshake] Ожидание AppData body ({appdata_body_len} байт)...")
+        log.debug(f"  [handshake] Waiting for AppData body ({appdata_body_len} bytes)...")
         appdata_body = await _read_exactly_logged(
             reader, appdata_body_len, "AppData body"
         )
-        log.info(f"  [handshake] AppData body получен: {len(appdata_body)} байт")
+        log.debug(f"  [handshake] AppData body received: {len(appdata_body)} bytes")
     else:
         appdata_body = b""
-        log.info("  [handshake] AppData body пустой (len=0)")
+        log.debug("  [handshake] AppData body empty (len=0)")
 
     # Шаг 6: проверка server digest
-    log.info("  [handshake] Проверка server digest (по полному ответу)...")
+    log.debug("  [handshake] Verifying server digest (over full response)...")
 
     server_full_response = (
         hdr + sh_body + ccs_appdata_prefix + remaining_len_bytes + appdata_body
     )
-    log.debug(f"  [handshake] Server full response: {len(server_full_response)} байт")
+    log.debug(f"  [handshake] Server full response: {len(server_full_response)} bytes")
 
     if (
         len(server_full_response)
         < _SERVER_HELLO_DIGEST_POSITION + _K_HELLO_DIGEST_LENGTH
     ):
         log.error(
-            f"  [handshake] Server response слишком короткий для digest: "
-            f"{len(server_full_response)} байт"
+            f"  [handshake] Server response too short for digest: "
+            f"{len(server_full_response)} bytes"
         )
-        raise ConnectionError("Server response слишком короткий для проверки digest")
+        raise ConnectionError("Server response too short to verify digest")
 
     server_digest = server_full_response[
         _SERVER_HELLO_DIGEST_POSITION : _SERVER_HELLO_DIGEST_POSITION
@@ -845,15 +845,15 @@ async def async_faketls_handshake(
     log.debug(f"  [handshake] Expected digest: {_hex(expected, 32)}")
 
     if not hmac.compare_digest(expected, server_digest):
-        log.error("  [handshake] HMAC сервера НЕ совпал!")
-        log.error(f"  [handshake]   server: {_hex(server_digest, 32)}")
+        log.error("  [handshake] Server HMAC mismatch!")
+        log.error(f"  [handshake]   server:   {_hex(server_digest, 32)}")
         log.error(f"  [handshake]   expected: {_hex(expected, 32)}")
         raise ConnectionError(
-            "HMAC сервера не совпал — прокси не распознал секрет "
-            "(соединение ушло в domain-fronting fallback)"
+            "Server HMAC mismatch — proxy did not recognize the secret "
+            "(connection went to a domain-fronting fallback)"
         )
 
-    log.info("  [handshake] [*] Server digest проверен, handshake завершён успешно")
+    log.info("  [handshake] FakeTLS handshake completed successfully")
     return appdata_body
 
 
@@ -894,15 +894,15 @@ class TLSRecordWriter:
         if self._send_ccs and prefix and not self._prefix_sent:
             out += _CLIENT_PREFIX
             self._prefix_sent = True
-            log.debug("  [tls-write] Отправлен CCS prefix (6 байт)")
+            log.debug("  [tls-write] CCS prefix sent (6 bytes)")
 
         if not data:
             if prefix:
                 record = prefix
                 out += _CLIENT_HEADER + struct.pack(">H", len(record)) + record
                 log.debug(
-                    f"  [tls-write] AppData record: prefix={len(prefix)} байт "
-                    f"(без data)"
+                    f"  [tls-write] AppData record: prefix={len(prefix)} bytes "
+                    f"(no data)"
                 )
             return bytes(out)
 
@@ -925,11 +925,11 @@ class TLSRecordWriter:
             if first_record:
                 log.debug(
                     f"  [tls-write] AppData record #1: prefix={len(prefix)} + "
-                    f"data={write_size} = {len(record)} байт"
+                    f"data={write_size} = {len(record)} bytes"
                 )
                 first_record = False
             else:
-                log.debug(f"  [tls-write] AppData record: data={write_size} байт")
+                log.debug(f"  [tls-write] AppData record: data={write_size} bytes")
 
         return bytes(out)
 
@@ -979,8 +979,8 @@ class TLSRecordUnwrapper:
 
             if n - pos < 5 + length:
                 log.debug(
-                    f"  [tls-read] Буфер {n - pos} < нужно {5 + length}, "
-                    f"ожидаем ещё данных"
+                    f"  [tls-read] Buffer {n - pos} < need {5 + length}, "
+                    f"waiting for more data"
                 )
                 break
 
@@ -988,23 +988,23 @@ class TLSRecordUnwrapper:
                 if buf[pos + 1] != 0x03 or buf[pos + 2] != 0x03:
                     version = bytes(buf[pos + 1 : pos + 3])
                     log.error(
-                        f"  [tls-read] Неверная версия TLS record: "
-                        f"{version.hex()} (ожидалось 0303)"
+                        f"  [tls-read] Invalid TLS record version: "
+                        f"{version.hex()} (expected 0303)"
                     )
                     raise ConnectionError(
-                        f"Неверная версия TLS record: {version.hex()}"
+                        f"Invalid TLS record version: {version.hex()}"
                     )
                 out += buf[pos + 5 : pos + 5 + length]
             elif rtype == 0x15:
                 payload = bytes(buf[pos + 5 : pos + 5 + length])
-                log.error(f"  [tls-read] Получен TLS Alert: {_hex(payload)}")
-                raise ConnectionError(f"Получен TLS Alert от прокси: {payload.hex()}")
+                log.error(f"  [tls-read] TLS Alert received: {_hex(payload)}")
+                raise ConnectionError(f"TLS Alert received from proxy: {payload.hex()}")
             elif rtype == 0x14:
-                log.error("  [tls-read] Неожиданный post-hello CCS record")
-                raise ConnectionError("Неожиданный post-hello CCS record")
+                log.error("  [tls-read] Unexpected post-hello CCS record")
+                raise ConnectionError("Unexpected post-hello CCS record")
             else:
-                log.error(f"  [tls-read] Неизвестный тип рекорда: 0x{rtype:02x}")
-                raise ConnectionError(f"Неизвестный TLS record type: 0x{rtype:02x}")
+                log.error(f"  [tls-read] Unknown record type: 0x{rtype:02x}")
+                raise ConnectionError(f"Unknown TLS record type: 0x{rtype:02x}")
 
             pos += 5 + length
 
@@ -1014,8 +1014,8 @@ class TLSRecordUnwrapper:
         self._total_out += len(out)
         if out:
             log.debug(
-                f"  [tls-read] Извлечено {len(out)} байт AppData "
-                f"(всего: in={self._total_in}, out={self._total_out})"
+                f"  [tls-read] Extracted {len(out)} bytes of AppData "
+                f"(totals: in={self._total_in}, out={self._total_out})"
             )
         return bytes(out)
 
@@ -1092,7 +1092,7 @@ def build_obfuscated2_header(
     """
     # *reinterpret_cast<int16*>(nonce+60) = _protocolDcId — signed int16.
     if not -32768 <= dc <= 32767:
-        raise ValueError(f"DC ID {dc} вне диапазона int16 [-32768, 32767]")
+        raise ValueError(f"DC ID {dc} out of int16 range [-32768, 32767]")
 
     init = bytearray(_generate_init())
 
@@ -1143,9 +1143,9 @@ def detect_client_transport_tag(first_bytes: bytes) -> tuple[bytes, int]:
     if first_bytes[:1] == b"\xef":
         return TAG_ABRIDGED, 1
     raise ValueError(
-        f"Неподдерживаемый транспорт: получено {first_bytes[:4].hex()!r}. "
-        f"Ожидается padded intermediate (0xDDDDDDDD) для ee/dd секретов "
-        f"или abridged (0xEF) для голых 16-байтных секретов."
+        f"Unsupported transport: got {first_bytes[:4].hex()!r}. "
+        f"Expected padded intermediate (0xDDDDDDDD) for ee/dd secrets "
+        f"or abridged (0xEF) for bare 16-byte secrets."
     )
 
 
@@ -1256,7 +1256,7 @@ async def guess_dc_id_async(target_host: str) -> int:
 
     if normalized in KNOWN_DC_IPS:
         dc = KNOWN_DC_IPS[normalized]
-        log.debug(f"  [dc-id] Найден по IP: {target_host} -> DC {dc}")
+        log.debug(f"  [dc-id] Found by IP: {target_host} -> DC {dc}")
         return dc
 
     # 2. DNS-resolve hostname → IP → lookup.
@@ -1269,25 +1269,25 @@ async def guess_dc_id_async(target_host: str) -> int:
             normalized_ip = _normalize_ip(ip)
             if normalized_ip in KNOWN_CDN_IPS:
                 cdn_dc = KNOWN_CDN_IPS[normalized_ip]
-                log.info(f"  [dc-id] CDN резолв {target_host} -> {ip} -> DC -{cdn_dc}")
+                log.info(f"  [dc-id] CDN resolved {target_host} -> {ip} -> DC -{cdn_dc}")
                 return -cdn_dc
             if normalized_ip in KNOWN_DC_IPS:
                 dc = KNOWN_DC_IPS[normalized_ip]
-                log.debug(f"  [dc-id] Резолв {target_host} -> {ip} -> DC {dc}")
+                log.debug(f"  [dc-id] Resolved {target_host} -> {ip} -> DC {dc}")
                 return dc
     except (socket.gaierror, OSError) as e:
         dns_error = e
 
     if dns_error:
         raise ValueError(
-            f"Не удалось определить DC ID для {target_host}: "
+            f"Could not determine DC ID for {target_host}: "
             f"DNS-resolve failed ({dns_error}). "
-            f"Используйте --dc-id-override."
+            f"Use --dc-id-override."
         ) from dns_error
     raise ValueError(
-        f"Не удалось определить DC ID для {target_host}: "
-        f"IP не найден в таблице built-in DC (TDesktop kBuiltInDcs + getConfig). "
-        f"Если target — нестандартный DC, используйте --dc-id-override."
+        f"Could not determine DC ID for {target_host}: "
+        f"IP not found in the built-in DC table (TDesktop kBuiltInDcs + getConfig). "
+        f"If the target is a non-standard DC, use --dc-id-override."
     )
 
 
@@ -1332,7 +1332,7 @@ async def _socks5_handshake(
         writer.write(b"\x05\xff")
         await writer.drain()
         raise ConnectionError(
-            "Клиент требует SOCKS5 аутентификацию, которая не поддерживается"
+            "Client requires SOCKS5 authentication, which is not supported"
         )
 
     writer.write(b"\x05\x00")
@@ -1350,7 +1350,7 @@ async def _socks5_handshake(
         addr_bytes = await reader.readexactly(16)
         host = str(ipaddress.IPv6Address(addr_bytes))
     else:
-        raise ValueError(f"Неподдерживаемый ATYP={atyp}")
+        raise ValueError(f"Unsupported ATYP={atyp}")
     port = struct.unpack(">H", await reader.readexactly(2))[0]
 
     writer.write(b"\x05\x00\x00\x01" + b"\x00" * 4 + b"\x00\x00")
@@ -1374,7 +1374,7 @@ async def _handle_client(
     """
     upstream_writer = None
     client_addr = writer.get_extra_info("peername")
-    log.info(f"[client {client_addr}] Новое соединение")
+    log.info(f"[client {client_addr}] New connection")
 
     # TCP_NODELAY на клиентский сокет — симметрично с upstream.
     _apply_tcp_tuning(writer, client_addr)
@@ -1392,7 +1392,7 @@ async def _handle_client(
     try:
         first_chunk = await asyncio.wait_for(reader.readexactly(4), timeout=10.0)
     except (asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
-        log.error(f"[client {client_addr}] Не удалось прочитать transport-тег: {e}")
+        log.error(f"[client {client_addr}] Failed to read transport tag: {e}")
         writer.close()
         return
 
@@ -1413,19 +1413,19 @@ async def _handle_client(
     }
     if protocol_tag != cfg.expected_tag:
         log.error(
-            f"[client {client_addr}] Несоответствие транспорта секрету: "
-            f"клиент использует {tag_names.get(protocol_tag, 'unknown')}, "
-            f"секрет требует {tag_names.get(cfg.expected_tag, 'unknown')}. "
-            f"Используйте protocol_factory={'TCPPadded' if cfg.expected_tag == TAG_PADDED_INTERMEDIATE else 'TCPAbridged'}."
+            f"[client {client_addr}] Transport/secret mismatch: "
+            f"client uses {tag_names.get(protocol_tag, 'unknown')}, "
+            f"secret requires {tag_names.get(cfg.expected_tag, 'unknown')}. "
+            f"Use protocol_factory={'TCPPadded' if cfg.expected_tag == TAG_PADDED_INTERMEDIATE else 'TCPAbridged'}."
         )
         writer.close()
         return
 
-    log.info(
-        f"[client {client_addr}] Transport-тег: {tag_names.get(protocol_tag, 'unknown')} (соответствует секрету)"
+    log.debug(
+        f"[client {client_addr}] Transport tag: {tag_names.get(protocol_tag, 'unknown')} (matches secret)"
     )
     log.debug(f"[client {client_addr}] First chunk: {_hex(first_chunk)}")
-    log.debug(f"[client {client_addr}] Leftover после тега: {len(leftover)} байт")
+    log.debug(f"[client {client_addr}] Leftover after tag: {len(leftover)} bytes")
 
     # DC ID определяется до подключения к upstream — незачем открывать TCP,
     # если не можем заполнить obfuscated2-заголовок.
@@ -1439,19 +1439,19 @@ async def _handle_client(
             log.error(f"[client {client_addr}] {e}")
             writer.close()
             return
-        log.info(f"[client {client_addr}] DC ID определён: {dc}")
+        log.info(f"[client {client_addr}] DC ID resolved: {dc}")
 
     try:
         log.info(
-            f"[client {client_addr}] Подключение к upstream {cfg.upstream_host}:{cfg.upstream_port}..."
+            f"[client {client_addr}] Connecting to upstream {cfg.upstream_host}:{cfg.upstream_port}..."
         )
         upstream_reader, upstream_writer = await asyncio.open_connection(
             cfg.upstream_host, cfg.upstream_port
         )
         _apply_tcp_tuning(upstream_writer, client_addr)
-        log.info(f"[client {client_addr}] TCP соединение с upstream установлено")
+        log.info(f"[client {client_addr}] TCP connection to upstream established")
     except OSError as e:
-        log.error(f"[client {client_addr}] Не удалось подключиться к upstream: {e}")
+        log.error(f"[client {client_addr}] Failed to connect to upstream: {e}")
         writer.close()
         return
 
@@ -1460,49 +1460,48 @@ async def _handle_client(
 
     try:
         if cfg.is_fake_tls:
-            log.info(f"[client {client_addr}] Запуск FakeTLS handshake...")
+            log.info(f"[client {client_addr}] Starting FakeTLS handshake...")
             server_initial_appdata = await async_faketls_handshake(
                 upstream_reader, upstream_writer, cfg.domain, cfg.secret_key
             )
             tls_writer = TLSRecordWriter(send_ccs=cfg.send_ccs)
             log.info(
-                f"[client {client_addr}] FakeTLS handshake завершён, "
-                f"server_initial_appdata={len(server_initial_appdata)} байт, "
+                f"[client {client_addr}] FakeTLS handshake completed, "
+                f"server_initial_appdata={len(server_initial_appdata)} bytes, "
                 f"send_ccs={cfg.send_ccs}"
             )
 
         keys = build_obfuscated2_header(protocol_tag, dc, cfg.secret_key)
-        log.info(
-            f"[client {client_addr}] Obfuscated2 заголовок построен: "
-            f"{len(keys.header)} байт, tag={protocol_tag.hex()}, dc={dc}"
+        log.debug(
+            f"[client {client_addr}] Obfuscated2 header built: "
+            f"{len(keys.header)} bytes, tag={protocol_tag.hex()}, dc={dc}"
         )
 
         # Leftover (байты после transport-тега) шифруем и отправляем как есть —
         # framing не транслируется, релеится end-to-end.
         first_encrypted = keys.encryptor.update(leftover) if leftover else b""
         log.debug(
-            f"[client {client_addr}] First encrypted chunk: {len(first_encrypted)} байт"
+            f"[client {client_addr}] First encrypted chunk: {len(first_encrypted)} bytes"
         )
 
         if cfg.is_fake_tls:
             wrapped = tls_writer.wrap(keys.header, first_encrypted)
             upstream_writer.write(wrapped)
             log.debug(
-                f"[client {client_addr}] Отправлено upstream (TLS-wrapped): "
-                f"{len(wrapped)} байт"
+                f"[client {client_addr}] Sent upstream (TLS-wrapped): "
+                f"{len(wrapped)} bytes"
             )
         else:
             upstream_writer.write(keys.header)
             if first_encrypted:
                 upstream_writer.write(first_encrypted)
             log.debug(
-                f"[client {client_addr}] Отправлено upstream (raw): "
-                f"{len(keys.header) + len(first_encrypted)} байт"
+                f"[client {client_addr}] Sent upstream (raw): "
+                f"{len(keys.header) + len(first_encrypted)} bytes"
             )
         await upstream_writer.drain()
-        log.info(f"[client {client_addr}] Obfuscated2 заголовок отправлен upstream")
     except Exception as e:
-        log.error(f"[client {client_addr}] Ошибка при setup tunnel: {e}")
+        log.error(f"[client {client_addr}] Tunnel setup error: {e}")
         log.error(traceback.format_exc())
         if upstream_writer:
             upstream_writer.close()
@@ -1516,11 +1515,11 @@ async def _handle_client(
     # мы тоже — скармливать unwrapper'у нельзя, это сломает его буфер.
     if server_initial_appdata:
         log.debug(
-            f"[client {client_addr}] Отброшен server_initial_appdata: "
-            f"{len(server_initial_appdata)} байт (часть handshake noise)"
+            f"[client {client_addr}] Discarded server_initial_appdata: "
+            f"{len(server_initial_appdata)} bytes (handshake noise)"
         )
 
-    log.info(f"[client {client_addr}] Туннель установлен, запуск релея")
+    log.info(f"[client {client_addr}] Tunnel established, starting relay")
 
     async def client_to_upstream() -> None:
         """Relay: client → obfuscated2 encrypt → upstream (TLS-wrapped если FakeTLS)."""
@@ -1532,13 +1531,13 @@ async def _handle_client(
                     )
                 except asyncio.TimeoutError:
                     log.warning(
-                        f"[client {client_addr}] client->upstream: нет активности "
-                        f"{ACTIVITY_TIMEOUT_SECS}s — разрыв по activity timeout"
+                        f"[client {client_addr}] client->upstream: no activity for "
+                        f"{ACTIVITY_TIMEOUT_SECS}s — closing by activity timeout"
                     )
                     break
                 if not data:
                     log.info(
-                        f"[client {client_addr}] Клиент закрыл соединение (read returned empty)"
+                        f"[client {client_addr}] Client closed connection (read returned empty)"
                     )
                     break
                 enc = keys.encryptor.update(data)
@@ -1547,11 +1546,11 @@ async def _handle_client(
                 else:
                     upstream_writer.write(enc)
                 await upstream_writer.drain()
-                log.debug(f"[client {client_addr}] client->upstream: {len(data)} байт")
+                log.debug(f"[client {client_addr}] client->upstream: {len(data)} bytes")
         except (ConnectionResetError, BrokenPipeError) as e:
             log.debug(f"[client {client_addr}] client->upstream: {e}")
         except Exception as e:
-            log.error(f"[client {client_addr}] client->upstream ошибка: {e}")
+            log.error(f"[client {client_addr}] client->upstream error: {e}")
             log.error(traceback.format_exc())
         finally:
             try:
@@ -1569,13 +1568,13 @@ async def _handle_client(
                     )
                 except asyncio.TimeoutError:
                     log.warning(
-                        f"[client {client_addr}] upstream->client: нет активности "
-                        f"{ACTIVITY_TIMEOUT_SECS}s — разрыв по activity timeout"
+                        f"[client {client_addr}] upstream->client: no activity for "
+                        f"{ACTIVITY_TIMEOUT_SECS}s — closing by activity timeout"
                     )
                     break
                 if not data:
                     log.info(
-                        f"[client {client_addr}] Upstream закрыл соединение (read returned empty)"
+                        f"[client {client_addr}] Upstream closed connection (read returned empty)"
                     )
                     break
                 plain_wire = unwrapper.feed(data) if unwrapper else data
@@ -1584,12 +1583,12 @@ async def _handle_client(
                     writer.write(dec)
                     await writer.drain()
                     log.debug(
-                        f"[client {client_addr}] upstream->client: {len(dec)} байт"
+                        f"[client {client_addr}] upstream->client: {len(dec)} bytes"
                     )
         except (ConnectionResetError, BrokenPipeError) as e:
             log.debug(f"[client {client_addr}] upstream->client: {e}")
         except Exception as e:
-            log.error(f"[client {client_addr}] upstream->client ошибка: {e}")
+            log.error(f"[client {client_addr}] upstream->client error: {e}")
             log.error(traceback.format_exc())
         finally:
             try:
@@ -1602,7 +1601,7 @@ async def _handle_client(
             client_to_upstream(), upstream_to_client(), return_exceptions=True
         )
     finally:
-        log.info(f"[client {client_addr}] Соединение закрыто")
+        log.info(f"[client {client_addr}] Connection closed")
         try:
             writer.close()
             if upstream_writer:
@@ -1612,7 +1611,7 @@ async def _handle_client(
 
 
 async def run_bridge(cfg: BridgeConfig) -> None:
-    """Запускает блокирующий SOCKS5-сервер (для CLI-режима)."""
+    """Start a blocking SOCKS5 server (CLI mode)."""
     server = await asyncio.start_server(
         lambda r, w: _handle_client(r, w, cfg), cfg.listen_host, cfg.listen_port
     )
@@ -1626,9 +1625,9 @@ async def run_bridge(cfg: BridgeConfig) -> None:
         )
     )
     print(
-        f"SOCKS5-мост слушает на {cfg.listen_host}:{cfg.listen_port}, "
-        f"туннель до {cfg.upstream_host}:{cfg.upstream_port} "
-        f"({'FakeTLS' if cfg.is_fake_tls else 'обычный obfuscated2'})"
+        f"SOCKS5 bridge listening on {cfg.listen_host}:{cfg.listen_port}, "
+        f"tunnel to {cfg.upstream_host}:{cfg.upstream_port} "
+        f"({'FakeTLS' if cfg.is_fake_tls else 'plain obfuscated2'})"
     )
     print(
         f"  transport={transport_name}, "
@@ -1640,32 +1639,31 @@ async def run_bridge(cfg: BridgeConfig) -> None:
 
 
 def is_mtproto_link(url: str) -> bool:
-    """Проверяет, является ли URL ``tg://proxy`` или ``t.me/proxy`` ссылкой."""
+    """Check whether ``url`` is a ``tg://proxy`` or ``t.me/proxy`` link."""
     url = url.strip().lower()
     return url.startswith("tg://proxy") or "t.me/proxy" in url
 
 
 def needs_padded_transport(url: str) -> bool:
-    """Определяет, требует ли MTProto-ссылка padded intermediate транспорт.
+    """Determine whether an MTProto link requires the padded intermediate transport.
 
-    Соответствие типов секрета транспорту (как в TDesktop
-    ``Protocol::Create``):
-        - 0xEE + 16 + domain → FakeTLS + padded   → True
-        - 0xDD + 16          → obfuscated2 + padded → True
-        - голые 16 байт      → obfuscated2 + abridged → False
+    Secret-type to transport mapping (mirrors TDesktop ``Protocol::Create``):
+        - 0xEE + 16 + domain → FakeTLS + padded      → True
+        - 0xDD + 16          → obfuscated2 + padded   → True
+        - bare 16 bytes      → obfuscated2 + abridged → False
 
-    Для не-MTProto URL всегда возвращает False (прямой транспорт).
+    For non-MTProto URLs always returns False (direct transport).
 
     Args:
-        url: ``tg://proxy?...`` или ``https://t.me/proxy?...`` ссылка.
+        url: ``tg://proxy?...`` or ``https://t.me/proxy?...`` link.
 
     Returns:
-        True, если клиент должен использовать ``TCPPadded``; False, если
-        ``TCPAbridged`` (или прямой транспорт для не-MTProto URL).
+        True if the client should use ``TCPPadded``; False if
+        ``TCPAbridged`` (or direct transport for non-MTProto URLs).
 
     Raises:
-        ValueError: ссылка невалидна или секрет нераспознан (пробрасывается
-            из :func:`parse_tg_link` / :func:`parse_secret`).
+        ValueError: the link is invalid or the secret is unrecognized
+            (propagated from :func:`parse_tg_link` / :func:`parse_secret`).
     """
     if not is_mtproto_link(url):
         return False
@@ -1685,23 +1683,23 @@ async def start_local_bridge(
     use_block_m: bool = True,
     use_block_e: bool = True,
 ) -> int:
-    """Поднимает мост как фоновую asyncio-задачу и возвращает локальный порт.
+    """Start the bridge as a background asyncio task and return the local port.
 
-    Используется для встраивания в приложение (например, перед запуском
-    Pyrogram/Kurigram клиента). Для остановки всех фоновых мостов
-    вызвать :func:`stop_all_bridges`.
+    Intended for embedding into an application (e.g. before starting a
+    Pyrogram/Kurigram client). To stop all background bridges, call
+    :func:`stop_all_bridges`.
 
     Args:
         tg_link: ``tg://proxy?server=...&port=...&secret=...``.
-        listen_host: хост для SOCKS5 (по умолчанию 127.0.0.1).
-        listen_port: порт; 0 = выбрать свободный автоматически.
-        dc_id_override: явно заданный DC ID (escape hatch; 0 = авто).
-        send_ccs: Отправлять CCS (kClientPrefix) перед первой AppData записью.
-        use_block_m: Использовать блок M (Kyber-like) в ClientHello.
-        use_block_e: Использовать блок E (random extra) в ClientHello.
+        listen_host: SOCKS5 host (default 127.0.0.1).
+        listen_port: port; 0 = pick a free one automatically.
+        dc_id_override: explicit DC ID (escape hatch; 0 = auto).
+        send_ccs: Send CCS (kClientPrefix) before the first AppData record.
+        use_block_m: Use block M (Kyber-like) in ClientHello.
+        use_block_e: Use block E (random extra) in ClientHello.
 
     Returns:
-        Фактический порт, на котором мост принял подключения.
+        The actual port the bridge is listening on.
     """
     link = parse_tg_link(tg_link)
     cfg = BridgeConfig(
@@ -1730,7 +1728,7 @@ async def start_local_bridge(
 
 
 async def stop_all_bridges() -> None:
-    """Корректно останавливает все фоновые мосты, запущенные через :func:`start_local_bridge`."""
+    """Gracefully stop all background bridges started via :func:`start_local_bridge`."""
     if not _running_servers:
         return
 
@@ -1745,7 +1743,7 @@ async def stop_all_bridges() -> None:
 
 
 def main() -> None:
-    """CLI entry point: парсит аргументы и запускает блокирующий мост."""
+    """CLI entry point: parse arguments and start a blocking bridge."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tg_link", help="tg://proxy?server=...&port=...&secret=...")
     parser.add_argument("--listen-host", default="127.0.0.1")
@@ -1755,23 +1753,23 @@ def main() -> None:
         "--no-ccs",
         action="store_true",
         default=False,
-        help="Не отправлять CCS (kClientPrefix) перед первой AppData "
-        "(по умолчанию отправляется, как TDesktop)",
+        help="Do not send CCS (kClientPrefix) before the first AppData record "
+        "(sent by default, like TDesktop)",
     )
     parser.add_argument(
         "--no-block-m",
         action="store_true",
         default=False,
-        help="Отключить блок M (Kyber-like) в ClientHello",
+        help="Disable block M (Kyber-like) in ClientHello",
     )
     parser.add_argument(
         "--no-block-e",
         action="store_true",
         default=False,
-        help="Отключить блок E в ClientHello",
+        help="Disable block E in ClientHello",
     )
     parser.add_argument(
-        "--debug", action="store_true", default=False, help="Включить DEBUG логирование"
+        "--debug", action="store_true", default=False, help="Enable DEBUG logging"
     )
     args = parser.parse_args()
 
