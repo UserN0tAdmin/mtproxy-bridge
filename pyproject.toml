@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mtproto-bridge"
+version = "0.1.0"
+description = "MTProxy (MTProto proxy) SOCKS5 bridge for Kurigram and other clients that support padded intermediate and (optional) abridged transport"
+readme = "README.md"
+license = "LGPL-3.0-or-later"
+license-files = ["COPYING", "COPYING.LESSER"]
+requires-python = ">=3.9"
+authors = [
+    { name = "UserN0tAdmin" }
+]
+keywords = ["mtproto", "telegram", "proxy", "socks5", "kurigram", "faketls", "mtproxy", "network", "mtproto-proxy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Communications",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Framework :: AsyncIO",
+]
+dependencies = [
+    "cryptography>=43.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/UserN0tAdmin/mtproto-bridge"
+Repository = "https://github.com/UserN0tAdmin/mtproto-bridge"
+Issues = "https://github.com/UserN0tAdmin/mtproto-bridge/issues"
+
+[project.scripts]
+mtproto-bridge = "mtproto_bridge:main"
+
+[tool.hatch.build.targets.wheel]
+include = ["mtproto_bridge.py"]
