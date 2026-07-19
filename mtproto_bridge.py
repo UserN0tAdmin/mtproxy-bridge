@@ -1342,7 +1342,9 @@ async def _socks5_handshake(
     """Проводит SOCKS5 handshake и возвращает (target_host, target_port).
 
     Поддерживаются: no-auth метод (0x00), CONNECT-команда, ATYP IPv4 /
-    domainname / IPv6. Любое отклонение рвёт соединение.
+    domainname / IPv6. VER сверяется в greeting и в request; CMD != CONNECT
+    получает reply 0x07 (Command not supported), после чего соединение
+    рвётся; прочие отклонения рвут соединение без reply.
 
     Raises:
         ConnectionError: клиент требует auth, неподдерживаемый ATYP,
@@ -1364,6 +1366,8 @@ async def _socks5_handshake(
             )
 
     greeting = await _rx(2, "greeting (VER+NMETHODS)")
+    if greeting[0] != 0x05:
+        raise ValueError(f"Unsupported SOCKS version in greeting: {greeting[0]:#x}")
     nmethods = greeting[1]
     methods = await _rx(nmethods, "methods")
 
@@ -1378,7 +1382,15 @@ async def _socks5_handshake(
     await writer.drain()
 
     req = await _rx(4, "request (VER+CMD+RSV+ATYP)")
-    _, cmd, _, atyp = req
+    ver, cmd, _, atyp = req
+    if ver != 0x05:
+        raise ValueError(f"Unsupported SOCKS version in request: {ver:#x}")
+    if cmd != 0x01:  # поддерживается только CONNECT
+        writer.write(b"\x05\x07\x00\x01" + b"\x00" * 4 + b"\x00\x00")
+        await writer.drain()
+        raise ValueError(
+            f"Unsupported SOCKS5 CMD={cmd:#x} (only CONNECT/0x01 is supported)"
+        )
     if atyp == 0x01:
         addr_bytes = await _rx(4, "IPv4 address")
         host = ".".join(str(b) for b in addr_bytes)
