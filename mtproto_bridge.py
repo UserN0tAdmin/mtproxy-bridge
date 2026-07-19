@@ -142,6 +142,18 @@ def _apply_tcp_tuning(writer: asyncio.StreamWriter, peer_label: object) -> None:
 # зависших upstream-прокси и утечки file descriptors при idle-коннектах.
 ACTIVITY_TIMEOUT_SECS = 1800  # 30 минут
 
+# Таймаут на каждый readexactly внутри SOCKS5 handshake (greeting/methods/
+# request/addr/port). Защищает от клиентов, которые установили TCP, но
+# не присылают (или присылают медленно) байты протокола — без этого FD
+# висит бесконечно (slowloris-поверхность).
+SOCKS5_HANDSHAKE_TIMEOUT_SECS = 15.0
+
+# Таймаут на установление TCP-соединения к upstream-прокси. Без этого
+# обрыв маршрута (молчаливый drop без RST) вешает корутину на OS-level
+# TCP connect timeout (~127 c на Linux). 15 c достаточно для любой
+# реальной сети; если upstream так далеко — что-то не так.
+UPSTREAM_CONNECT_TIMEOUT_SECS = 15.0
+
 
 # ============================================================================
 # Разбор tg://proxy?server=...&port=...&secret=... и секрета
@@ -1333,11 +1345,27 @@ async def _socks5_handshake(
     domainname / IPv6. Любое отклонение рвёт соединение.
 
     Raises:
-        ConnectionError: клиент требует auth, неподдерживаемый ATYP.
+        ConnectionError: клиент требует auth, неподдерживаемый ATYP,
+            таймаут чтения.
+        asyncio.IncompleteReadError: клиент закрыл соединение до
+            завершения handshake.
     """
-    greeting = await reader.readexactly(2)
+
+    async def _rx(n: int, what: str) -> bytes:
+        """readexactly с таймаутом; по timeout кидает ConnectionError."""
+        try:
+            return await asyncio.wait_for(
+                reader.readexactly(n), timeout=SOCKS5_HANDSHAKE_TIMEOUT_SECS
+            )
+        except asyncio.TimeoutError:
+            raise ConnectionError(
+                f"SOCKS5 handshake timeout reading {what} "
+                f"({SOCKS5_HANDSHAKE_TIMEOUT_SECS}s, need {n} bytes)"
+            )
+
+    greeting = await _rx(2, "greeting (VER+NMETHODS)")
     nmethods = greeting[1]
-    methods = await reader.readexactly(nmethods)
+    methods = await _rx(nmethods, "methods")
 
     if 0x00 not in methods:
         writer.write(b"\x05\xff")
@@ -1349,20 +1377,20 @@ async def _socks5_handshake(
     writer.write(b"\x05\x00")
     await writer.drain()
 
-    req = await reader.readexactly(4)
+    req = await _rx(4, "request (VER+CMD+RSV+ATYP)")
     _, cmd, _, atyp = req
     if atyp == 0x01:
-        addr_bytes = await reader.readexactly(4)
+        addr_bytes = await _rx(4, "IPv4 address")
         host = ".".join(str(b) for b in addr_bytes)
     elif atyp == 0x03:
-        length = (await reader.readexactly(1))[0]
-        host = (await reader.readexactly(length)).decode("ascii")
+        length = (await _rx(1, "domain length"))[0]
+        host = (await _rx(length, "domain")).decode("ascii")
     elif atyp == 0x04:
-        addr_bytes = await reader.readexactly(16)
+        addr_bytes = await _rx(16, "IPv6 address")
         host = str(ipaddress.IPv6Address(addr_bytes))
     else:
         raise ValueError(f"Unsupported ATYP={atyp}")
-    port = struct.unpack(">H", await reader.readexactly(2))[0]
+    port = struct.unpack(">H", await _rx(2, "port"))[0]
 
     writer.write(b"\x05\x00\x00\x01" + b"\x00" * 4 + b"\x00\x00")
     await writer.drain()
@@ -1401,9 +1429,22 @@ async def _handle_client(
         return
 
     try:
-        first_chunk = await asyncio.wait_for(reader.readexactly(4), timeout=10.0)
-    except (asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
-        log.error(f"[client {client_addr}] Failed to read transport tag: {e}")
+        first_chunk = await asyncio.wait_for(
+            reader.readexactly(4), timeout=SOCKS5_HANDSHAKE_TIMEOUT_SECS
+        )
+    except asyncio.TimeoutError:
+        log.error(
+            f"[client {client_addr}] Timeout reading transport tag "
+            f"({SOCKS5_HANDSHAKE_TIMEOUT_SECS}s) — client connected but sent nothing "
+            f"after SOCKS5 handshake"
+        )
+        writer.close()
+        return
+    except asyncio.IncompleteReadError as e:
+        log.error(
+            f"[client {client_addr}] Failed to read transport tag: "
+            f"got {len(e.partial)}/4 bytes"
+        )
         writer.close()
         return
 
@@ -1456,9 +1497,18 @@ async def _handle_client(
         log.info(
             f"[client {client_addr}] Connecting to upstream {cfg.upstream_host}:{cfg.upstream_port}..."
         )
-        upstream_reader, upstream_writer = await asyncio.open_connection(
-            cfg.upstream_host, cfg.upstream_port
-        )
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    cfg.upstream_host, cfg.upstream_port
+                ),
+                timeout=UPSTREAM_CONNECT_TIMEOUT_SECS,
+            )
+        except asyncio.TimeoutError:
+            raise OSError(
+                f"upstream connect timeout ({UPSTREAM_CONNECT_TIMEOUT_SECS}s) "
+                f"to {cfg.upstream_host}:{cfg.upstream_port}"
+            )
         _apply_tcp_tuning(upstream_writer, client_addr)
         log.info(f"[client {client_addr}] TCP connection to upstream established")
     except OSError as e:
