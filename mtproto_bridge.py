@@ -703,6 +703,8 @@ async def async_faketls_handshake(
     writer: asyncio.StreamWriter,
     domain: str,
     secret_key: bytes,
+    use_block_m: bool = True,
+    use_block_e: bool = True,
 ) -> bytes:
     """Асинхронный клиентский FakeTLS handshake.
 
@@ -714,6 +716,10 @@ async def async_faketls_handshake(
         writer: поток записи к upstream-прокси.
         domain: SNI-домен из ee-секрета.
         secret_key: 16-байтный секрет прокси.
+        use_block_m: флаг блока M (Kyber-like key share) в ClientHello,
+            пробрасывается в :func:`_prepare_client_hello`.
+        use_block_e: флаг блока E в ClientHello, пробрасывается
+            в :func:`_prepare_client_hello`.
 
     Returns:
         Байты первого AppData body от сервера (может быть пустым).
@@ -725,7 +731,12 @@ async def async_faketls_handshake(
     log.info(f"  [handshake] FakeTLS handshake starting, domain='{domain}'")
 
     # Шаг 1: ClientHello
-    hello = _prepare_client_hello(domain.encode("ascii", errors="replace"), secret_key)
+    hello = _prepare_client_hello(
+        domain.encode("ascii", errors="replace"),
+        secret_key,
+        use_block_m=use_block_m,
+        use_block_e=use_block_e,
+    )
     log.debug(f"  [handshake] ClientHello generated: {len(hello.data)} bytes")
     log.debug(f"  [handshake] ClientHello first 32 bytes: {_hex(hello.data, 32)}")
     log.debug(f"  [handshake] ClientHello digest: {_hex(hello.digest, 32)}")
@@ -1462,7 +1473,8 @@ async def _handle_client(
         if cfg.is_fake_tls:
             log.info(f"[client {client_addr}] Starting FakeTLS handshake...")
             server_initial_appdata = await async_faketls_handshake(
-                upstream_reader, upstream_writer, cfg.domain, cfg.secret_key
+                upstream_reader, upstream_writer, cfg.domain, cfg.secret_key,
+                use_block_m=cfg.use_block_m, use_block_e=cfg.use_block_e,
             )
             tls_writer = TLSRecordWriter(send_ccs=cfg.send_ccs)
             log.info(
