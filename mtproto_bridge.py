@@ -178,15 +178,19 @@ class ProxyLink(NamedTuple):
 def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
     """Parse an MTProto secret in hex or base64url form.
 
-    Returns:
-        Tuple ``(key, domain, is_fake_tls, expected_transport_tag)``:
-            - bare 16 bytes       → (raw, "", False, TAG_ABRIDGED)
-            - 0xEE + 16 + domain  → (raw[1:17], domain, True, TAG_PADDED_INTERMEDIATE)
-            - 0xDD + 16           → (raw[1:17], "", False, TAG_PADDED_INTERMEDIATE)
+    TDesktop semantics (connection_tcp.cpp Protocol::Create,
+    mtproto_tls_socket.cpp TlsSocket ctor):
+        - bare 16 bytes            → Version1, obfuscated2 + abridged
+        - 0xEE + 16 + domain (len ≥ 21, domain ≥ 4 bytes)
+                                    → FakeTLS + VersionD, padded intermediate
+        - 0xDD + 16 (len == 17)
+                                    → VersionD, obfuscated2 + padded intermediate
+
+    Empty secret (TDesktop Version0, plain TCP) is NOT supported by the bridge.
 
     Raises:
-        ValueError: empty secret, unrecognized format, or a typed secret
-            that is too short.
+        ValueError: empty secret, unrecognized format, or secret length
+            that does not match any of the three valid TDesktop patterns.
     """
     s = secret_str.strip()
     if all(c in "0123456789abcdefABCDEF" for c in s) and len(s) % 2 == 0:
@@ -197,32 +201,45 @@ def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
         raw = base64.b64decode(b64)
 
     if not raw:
-        raise ValueError("Empty secret")
+        raise ValueError(
+            "Empty secret — TDesktop Version0 (plain TCP) is not supported "
+            "by this bridge; provide a 16-byte / 0xDD / 0xEE secret"
+        )
 
     if len(raw) == 16:
         return raw, "", False, TAG_ABRIDGED
+
     if raw[0] == 0xEE:
-        if len(raw) < 17:
+        # TDesktop: secret.size() >= 21 (16 key + 1 type + ≥4 domain)
+        if len(raw) < 21:
             raise ValueError(
-                f"FakeTLS secret shorter than 17 bytes (len={len(raw)}); "
-                f"if this is a bare secret, it must be exactly 16 bytes"
+                f"FakeTLS (ee) secret must be ≥21 bytes "
+                f"(0xEE + 16-byte key + ≥4-byte domain), got {len(raw)}"
             )
-        return (
-            raw[1:17],
-            raw[17:].decode("ascii", errors="replace"),
-            True,
-            TAG_PADDED_INTERMEDIATE,
-        )
-    if raw[0] == 0xDD:
-        if len(raw) < 17:
+        domain_bytes = raw[17:]
+        # TDesktop copies domain bytes verbatim - preserve as ASCII only,
+        # refuse anything else so we don't silently corrupt SNI
+        try:
+            domain = domain_bytes.decode("ascii")
+        except UnicodeDecodeError as e:
             raise ValueError(
-                f"dd-secret shorter than 17 bytes (len={len(raw)}); "
-                f"if this is a bare secret, it must be exactly 16 bytes"
+                f"FakeTLS domain must be ASCII, got non-ASCII bytes: {e}"
+            ) from e
+        return raw[1:17], domain, True, TAG_PADDED_INTERMEDIATE
+
+    if raw[0] == 0xDD:
+        # TDesktop: secret.size() == 17 (0xDD + 16-byte key)
+        if len(raw) != 17:
+            raise ValueError(
+                f"dd-secret must be exactly 17 bytes (0xDD + 16-byte key), "
+                f"got {len(raw)}"
             )
         return raw[1:17], "", False, TAG_PADDED_INTERMEDIATE
+
     raise ValueError(
-        f"Unrecognized secret format (first byte=0x{raw[0]:02x}, len={len(raw)}); "
-        f"expected 16 bytes (bare) or 0xDD/0xEE + 16 bytes (typed)"
+        f"Unrecognized secret format (first byte=0x{raw[0]:02x}, "
+        f"len={len(raw)}); expected 16 bytes (bare), 0xDD + 16 bytes, "
+        f"or 0xEE + 16 bytes + ASCII domain (≥4 bytes)"
     )
 
 
@@ -744,7 +761,7 @@ async def async_faketls_handshake(
 
     # Шаг 1: ClientHello
     hello = _prepare_client_hello(
-        domain.encode("ascii", errors="replace"),
+        domain.encode("ascii"),
         secret_key,
         use_block_m=use_block_m,
         use_block_e=use_block_e,
