@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mtproto-bridge"
+name = "mtproxy-bridge"
 version = "0.1.0"
 description = "MTProxy (MTProto proxy) SOCKS5 bridge for Kurigram and other clients that support padded intermediate and (optional) abridged transport"
 readme = "README.md"
@@ -37,12 +37,12 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/UserN0tAdmin/mtproto-bridge"
-Repository = "https://github.com/UserN0tAdmin/mtproto-bridge"
-Issues = "https://github.com/UserN0tAdmin/mtproto-bridge/issues"
+Homepage = "https://github.com/UserN0tAdmin/mtproxy-bridge"
+Repository = "https://github.com/UserN0tAdmin/mtproxy-bridge"
+Issues = "https://github.com/UserN0tAdmin/mtproxy-bridge/issues"
 
 [project.scripts]
-mtproto-bridge = "mtproto_bridge:main"
+mtproxy-bridge = "mtproxy-bridge:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["mtproto_bridge.py"]
+include = ["mtproxy-bridge.py"]
