@@ -70,7 +70,7 @@ try:
         CipherContext,
     )
     from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 except ImportError as e:
     raise SystemExit(
         "Required package 'cryptography' is missing (pip install cryptography)"
@@ -554,10 +554,10 @@ class _HelloPart:
             self._result.extend(self._domain)
 
         elif isinstance(blk, _BlkPubKey):
-            # GeneratePublicKey(): настоящий Ed25519 public key (32 байта).
+            # GeneratePublicKey(): настоящий x25519 public key (32 байта).
             if not self._grow(32):
                 return
-            priv = Ed25519PrivateKey.generate()
+            priv = X25519PrivateKey.generate()
             self._result.extend(priv.public_key().public_bytes_raw())
 
         elif isinstance(blk, _BlkScope):
