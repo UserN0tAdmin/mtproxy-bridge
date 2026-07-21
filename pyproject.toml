@@ -42,7 +42,7 @@ Repository = "https://github.com/UserN0tAdmin/mtproxy-bridge"
 Issues = "https://github.com/UserN0tAdmin/mtproxy-bridge/issues"
 
 [project.scripts]
-mtproxy-bridge = "mtproxy-bridge:main"
+mtproxy-bridge = "mtproxy_bridge:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["mtproxy-bridge.py"]
+include = ["mtproxy_bridge.py"]
