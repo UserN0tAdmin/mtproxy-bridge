@@ -226,14 +226,14 @@ def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
                 f"(0xEE + 16-byte key + ≥1-byte domain), got {len(raw)}"
             )
         # TDLib: ProxySecret::get_domain() returns secret_.substr(17),
-        # но обрезается до MAX_DOMAIN_LENGTH = 182 (ProxySecret.h:18).
-        domain_bytes = raw[17:17 + _MAX_DOMAIN_LENGTH]
+        # (ProxySecret.h:18).
         if len(raw) > 17 + _MAX_DOMAIN_LENGTH:
-            log.warning(
+            raise ValueError(
                 f"FakeTLS domain too long ({len(raw) - 17} bytes), "
                 f"truncated to {_MAX_DOMAIN_LENGTH} bytes (TDLib MAX_DOMAIN_LENGTH)"
             )
         # Preserve as ASCII only, refuse anything else so we don't silently corrupt SNI
+        domain_bytes = raw[17:]
         try:
             domain = domain_bytes.decode("ascii")
         except UnicodeDecodeError as e:
@@ -554,7 +554,6 @@ class _HelloPart:
             self._result.extend(self._domain)
 
         elif isinstance(blk, _BlkPubKey):
-            # GeneratePublicKey(): настоящий x25519 public key (32 байта).
             if not self._grow(32):
                 return
             priv = X25519PrivateKey.generate()
