@@ -152,7 +152,7 @@ SOCKS5_HANDSHAKE_TIMEOUT_SECS = 15.0
 # обрыв маршрута (молчаливый drop без RST) вешает корутину на OS-level
 # TCP connect timeout (~127 c на Linux). 15 c достаточно для любой
 # реальной сети; если upstream так далеко — что-то не так.
-UPSTREAM_CONNECT_TIMEOUT_SECS = 15.0
+UPSTREAM_CONNECT_TIMEOUT_SECS = 5.0
 
 
 # ============================================================================
@@ -1760,7 +1760,7 @@ async def run_bridge(cfg: BridgeConfig) -> None:
         )
     )
     print(
-        f"SOCKS5 bridge listening on {cfg.listen_host}:{cfg.listen_port}, "
+        f"SOCKS5 bridge listening on socks5://{cfg.listen_host}:{cfg.listen_port}, "
         f"tunnel to {cfg.upstream_host}:{cfg.upstream_port} "
         f"({'FakeTLS' if cfg.is_fake_tls else 'plain obfuscated2'})"
     )
@@ -1912,7 +1912,6 @@ def main() -> None:
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S.%f",
     )
 
     link = parse_tg_link(args.tg_link)
