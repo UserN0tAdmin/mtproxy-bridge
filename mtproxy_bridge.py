@@ -32,13 +32,13 @@ Transport framing is determined by the secret type (mirrors TDLib
    - bare 16 bytes            → obfuscated2 + abridged  (0xEFEFEFEF)
 
 The bridge does NOT translate framing: the client must use the transport
-matching the secret (``TCPPadded`` for ee/dd, ``TCPAbridged`` for bare
+matching the secret (``TCPIntermediatePadded`` for ee/dd, ``TCPAbridged`` for bare
 16-byte secrets). After the handshake, bytes are relayed end-to-end as-is.
 
 Key features:
     - server_initial_appdata (FakeTLS handshake noise) is discarded;
     - the transport tag for obfuscated2 is taken from the secret;
-    - CCS (TDLib ``first_prefix`` = ``\x14\x03\x03\x00\x01\x01``) is sent by default;
+    - CCS (TDLib ``first_prefix``) is sent by default;
     - incremental parser for ServerHello and TLS Application Data;
     - 30-minute activity timeout;
     - reverse IP → DC ID mapping via a built-in table (TDLib
@@ -230,7 +230,7 @@ def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
         if len(raw) > 17 + _MAX_DOMAIN_LENGTH:
             raise ValueError(
                 f"FakeTLS domain too long ({len(raw) - 17} bytes), "
-                f"truncated to {_MAX_DOMAIN_LENGTH} bytes (TDLib MAX_DOMAIN_LENGTH)"
+                f"maximum allowed is {_MAX_DOMAIN_LENGTH} bytes"
             )
         # Preserve as ASCII only, refuse anything else so we don't silently corrupt SNI
         domain_bytes = raw[17:]
@@ -1539,7 +1539,7 @@ async def _handle_client(
             f"[client {client_addr}] Transport/secret mismatch: "
             f"client uses {tag_names.get(protocol_tag, 'unknown')}, "
             f"secret requires {tag_names.get(cfg.expected_tag, 'unknown')}. "
-            f"Use protocol_factory={'TCPPadded' if cfg.expected_tag == TAG_PADDED_INTERMEDIATE else 'TCPAbridged'}."
+            f"Use protocol_factory={'TCPIntermediatePadded' if cfg.expected_tag == TAG_PADDED_INTERMEDIATE else 'TCPAbridged'}."
         )
         writer.close()
         return
@@ -1794,7 +1794,7 @@ def needs_padded_transport(url: str) -> bool:
         url: ``tg://proxy?...`` or ``https://t.me/proxy?...`` link.
 
     Returns:
-        True if the client should use ``TCPPadded``; False if
+        True if the client should use ``TCPIntermediatePadded``; False if
         ``TCPAbridged`` (or direct transport for non-MTProto URLs).
 
     Raises:
