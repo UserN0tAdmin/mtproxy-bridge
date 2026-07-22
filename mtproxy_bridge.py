@@ -80,7 +80,7 @@ except ImportError as e:
 # Логирование
 # ============================================================================
 
-log = logging.getLogger("mtproto_bridge")
+log = logging.getLogger("mtproxy_bridge")
 
 
 def _hex(data: bytes, limit: int = 64) -> str:
