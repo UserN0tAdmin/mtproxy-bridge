@@ -1760,12 +1760,12 @@ async def run_bridge(cfg: BridgeConfig) -> None:
         )
     )
     print(
-        f"SOCKS5 bridge listening on socks5://{cfg.listen_host}:{cfg.listen_port}, "
+        f"SOCKS5 bridge listening on \n\nsocks5://{cfg.listen_host}:{cfg.listen_port}\n\n"
         f"tunnel to {cfg.upstream_host}:{cfg.upstream_port} "
         f"({'FakeTLS' if cfg.is_fake_tls else 'plain obfuscated2'})"
     )
     print(
-        f"  transport={transport_name}, "
+        f"transport={transport_name}, "
         f"send_ccs={cfg.send_ccs}, use_block_m={cfg.use_block_m}, "
         f"use_block_e={cfg.use_block_e}"
     )
