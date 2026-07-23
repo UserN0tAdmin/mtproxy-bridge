@@ -50,7 +50,6 @@ import signal
 import socket
 import struct
 import time
-import traceback
 from typing import Callable, NamedTuple
 from urllib.parse import urlparse, parse_qs
 
@@ -1603,8 +1602,7 @@ async def _handle_client(
                 )
             await upstream_writer.drain()
         except Exception as e:
-            log.error(f"[client {client_addr}] Tunnel setup error: {e}")
-            log.error(traceback.format_exc())
+            log.exception(f"[client {client_addr}] Tunnel setup error: {e}")
             if upstream_writer:
                 upstream_writer.close()
             writer.close()
@@ -1653,8 +1651,7 @@ async def _handle_client(
             except (ConnectionResetError, BrokenPipeError) as e:
                 log.debug(f"[client {client_addr}] client->upstream: {e}")
             except Exception as e:
-                log.error(f"[client {client_addr}] client->upstream error: {e}")
-                log.error(traceback.format_exc())
+                log.exception(f"[client {client_addr}] client->upstream error: {e}")
             finally:
                 try:
                     upstream_writer.close()
@@ -1691,8 +1688,7 @@ async def _handle_client(
             except (ConnectionResetError, BrokenPipeError) as e:
                 log.debug(f"[client {client_addr}] upstream->client: {e}")
             except Exception as e:
-                log.error(f"[client {client_addr}] upstream->client error: {e}")
-                log.error(traceback.format_exc())
+                log.exception(f"[client {client_addr}] upstream->client error: {e}")
             finally:
                 try:
                     writer.close()
@@ -1747,8 +1743,19 @@ def _make_connection_tracker(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         task = asyncio.create_task(_handle_client(reader, writer, cfg))
+
+        def _on_done(t: asyncio.Task) -> None:
+            active.discard(t)
+            if not t.cancelled():
+                exc = t.exception()
+                if exc is not None:
+                    log.error(
+                        f"Unhandled error in client connection task: {exc!r}",
+                        exc_info=exc,
+                    )
+
         active.add(task)
-        task.add_done_callback(active.discard)
+        task.add_done_callback(_on_done)
 
     return _client_connected, active
 
