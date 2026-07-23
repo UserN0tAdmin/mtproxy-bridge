@@ -54,12 +54,14 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import os
 import secrets
+import signal
 import socket
 import struct
 import time
 import traceback
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 from urllib.parse import urlparse, parse_qs
 
 try:
@@ -153,6 +155,14 @@ SOCKS5_HANDSHAKE_TIMEOUT_SECS = 15.0
 # TCP connect timeout (~127 c на Linux). 15 c достаточно для любой
 # реальной сети; если upstream так далеко — что-то не так.
 UPSTREAM_CONNECT_TIMEOUT_SECS = 5.0
+
+# При остановке сервера (SIGINT/SIGTERM) уже открытые клиентские соединения
+# отменяются и им даётся это время на то, чтобы отработать свои
+# except/finally и закрыть сокеты. Отмена в asyncio доставляется на
+# ближайшей точке await, так что обычно всё укладывается в миллисекунды;
+# таймаут — просто страховка от зависшей корутины, чтобы shutdown не мог
+# заблокироваться навсегда.
+SHUTDOWN_GRACE_SECS = 5.0
 
 
 # ============================================================================
@@ -1490,251 +1500,254 @@ async def _handle_client(
     _apply_tcp_tuning(writer, client_addr)
 
     try:
-        target_host, _target_port = await _socks5_handshake(reader, writer)
-        log.info(
-            f"[client {client_addr}] SOCKS5 handshake OK, target={target_host}:{_target_port}"
-        )
-    except Exception as e:
-        log.error(f"[client {client_addr}] SOCKS5 handshake failed: {e}")
-        writer.close()
-        return
-
-    try:
-        first_chunk = await asyncio.wait_for(
-            reader.readexactly(4), timeout=SOCKS5_HANDSHAKE_TIMEOUT_SECS
-        )
-    except asyncio.TimeoutError:
-        log.error(
-            f"[client {client_addr}] Timeout reading transport tag "
-            f"({SOCKS5_HANDSHAKE_TIMEOUT_SECS}s) — client connected but sent nothing "
-            f"after SOCKS5 handshake"
-        )
-        writer.close()
-        return
-    except asyncio.IncompleteReadError as e:
-        log.error(
-            f"[client {client_addr}] Failed to read transport tag: "
-            f"got {len(e.partial)}/4 bytes"
-        )
-        writer.close()
-        return
-
-    try:
-        protocol_tag, consumed = detect_client_transport_tag(first_chunk)
-    except ValueError as e:
-        log.error(f"[client {client_addr}] {e}")
-        writer.close()
-        return
-    leftover = first_chunk[consumed:]
-
-    # Валидация: транспорт клиента должен соответствовать типу секрета.
-    # Нарушение ломает obfuscated2 handshake (тег сверяется сервером)
-    # и traffic-shaping.
-    tag_names = {
-        TAG_ABRIDGED: "abridged (0xEF)",
-        TAG_PADDED_INTERMEDIATE: "padded intermediate (0xDD)",
-    }
-    if protocol_tag != cfg.expected_tag:
-        log.error(
-            f"[client {client_addr}] Transport/secret mismatch: "
-            f"client uses {tag_names.get(protocol_tag, 'unknown')}, "
-            f"secret requires {tag_names.get(cfg.expected_tag, 'unknown')}. "
-            f"Use protocol_factory={'TCPIntermediatePadded' if cfg.expected_tag == TAG_PADDED_INTERMEDIATE else 'TCPAbridged'}."
-        )
-        writer.close()
-        return
-
-    log.debug(
-        f"[client {client_addr}] Transport tag: {tag_names.get(protocol_tag, 'unknown')} (matches secret)"
-    )
-    log.debug(f"[client {client_addr}] First chunk: {_hex(first_chunk)}")
-    log.debug(f"[client {client_addr}] Leftover after tag: {len(leftover)} bytes")
-
-    # DC ID определяется до подключения к upstream — незачем открывать TCP,
-    # если не можем заполнить obfuscated2-заголовок.
-    if cfg.dc_id_override:
-        dc = cfg.dc_id_override
-        log.info(f"[client {client_addr}] DC ID override: {dc}")
-    else:
         try:
-            dc = await guess_dc_id_async(target_host)
+            target_host, _target_port = await _socks5_handshake(reader, writer)
+            log.info(
+                f"[client {client_addr}] SOCKS5 handshake OK, target={target_host}:{_target_port}"
+            )
+        except Exception as e:
+            log.error(f"[client {client_addr}] SOCKS5 handshake failed: {e}")
+            writer.close()
+            return
+
+        try:
+            first_chunk = await asyncio.wait_for(
+                reader.readexactly(4), timeout=SOCKS5_HANDSHAKE_TIMEOUT_SECS
+            )
+        except asyncio.TimeoutError:
+            log.error(
+                f"[client {client_addr}] Timeout reading transport tag "
+                f"({SOCKS5_HANDSHAKE_TIMEOUT_SECS}s) — client connected but sent nothing "
+                f"after SOCKS5 handshake"
+            )
+            writer.close()
+            return
+        except asyncio.IncompleteReadError as e:
+            log.error(
+                f"[client {client_addr}] Failed to read transport tag: "
+                f"got {len(e.partial)}/4 bytes"
+            )
+            writer.close()
+            return
+
+        try:
+            protocol_tag, consumed = detect_client_transport_tag(first_chunk)
         except ValueError as e:
             log.error(f"[client {client_addr}] {e}")
             writer.close()
             return
-        log.info(f"[client {client_addr}] DC ID resolved: {dc}")
+        leftover = first_chunk[consumed:]
 
-    try:
-        log.info(
-            f"[client {client_addr}] Connecting to upstream {cfg.upstream_host}:{cfg.upstream_port}..."
-        )
-        try:
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    cfg.upstream_host, cfg.upstream_port
-                ),
-                timeout=UPSTREAM_CONNECT_TIMEOUT_SECS,
+        # Валидация: транспорт клиента должен соответствовать типу секрета.
+        # Нарушение ломает obfuscated2 handshake (тег сверяется сервером)
+        # и traffic-shaping.
+        tag_names = {
+            TAG_ABRIDGED: "abridged (0xEF)",
+            TAG_PADDED_INTERMEDIATE: "padded intermediate (0xDD)",
+        }
+        if protocol_tag != cfg.expected_tag:
+            log.error(
+                f"[client {client_addr}] Transport/secret mismatch: "
+                f"client uses {tag_names.get(protocol_tag, 'unknown')}, "
+                f"secret requires {tag_names.get(cfg.expected_tag, 'unknown')}. "
+                f"Use protocol_factory={'TCPIntermediatePadded' if cfg.expected_tag == TAG_PADDED_INTERMEDIATE else 'TCPAbridged'}."
             )
-        except asyncio.TimeoutError:
-            raise OSError(
-                f"upstream connect timeout ({UPSTREAM_CONNECT_TIMEOUT_SECS}s) "
-                f"to {cfg.upstream_host}:{cfg.upstream_port}"
-            )
-        _apply_tcp_tuning(upstream_writer, client_addr)
-        log.info(f"[client {client_addr}] TCP connection to upstream established")
-    except OSError as e:
-        log.error(f"[client {client_addr}] Failed to connect to upstream: {e}")
-        writer.close()
-        return
+            writer.close()
+            return
 
-    tls_writer: TLSRecordWriter | None = None
-    server_initial_appdata = b""
-
-    try:
-        if cfg.is_fake_tls:
-            log.info(f"[client {client_addr}] Starting FakeTLS handshake...")
-            server_initial_appdata = await async_faketls_handshake(
-                upstream_reader, upstream_writer, cfg.domain, cfg.secret_key,
-                use_block_m=cfg.use_block_m, use_block_e=cfg.use_block_e,
-            )
-            tls_writer = TLSRecordWriter(send_ccs=cfg.send_ccs)
-            log.info(
-                f"[client {client_addr}] FakeTLS handshake completed, "
-                f"server_initial_appdata={len(server_initial_appdata)} bytes, "
-                f"send_ccs={cfg.send_ccs}"
-            )
-
-        keys = build_obfuscated2_header(protocol_tag, dc, cfg.secret_key)
         log.debug(
-            f"[client {client_addr}] Obfuscated2 header built: "
-            f"{len(keys.header)} bytes, tag={protocol_tag.hex()}, dc={dc}"
+            f"[client {client_addr}] Transport tag: {tag_names.get(protocol_tag, 'unknown')} (matches secret)"
         )
+        log.debug(f"[client {client_addr}] First chunk: {_hex(first_chunk)}")
+        log.debug(f"[client {client_addr}] Leftover after tag: {len(leftover)} bytes")
 
-        # Leftover (байты после transport-тега) шифруем и отправляем как есть —
-        # framing не транслируется, релеится end-to-end.
-        first_encrypted = keys.encryptor.update(leftover) if leftover else b""
-        log.debug(
-            f"[client {client_addr}] First encrypted chunk: {len(first_encrypted)} bytes"
-        )
-
-        if cfg.is_fake_tls:
-            wrapped = tls_writer.wrap(keys.header, first_encrypted)
-            upstream_writer.write(wrapped)
-            log.debug(
-                f"[client {client_addr}] Sent upstream (TLS-wrapped): "
-                f"{len(wrapped)} bytes"
-            )
+        # DC ID определяется до подключения к upstream — незачем открывать TCP,
+        # если не можем заполнить obfuscated2-заголовок.
+        if cfg.dc_id_override:
+            dc = cfg.dc_id_override
+            log.info(f"[client {client_addr}] DC ID override: {dc}")
         else:
-            upstream_writer.write(keys.header)
-            if first_encrypted:
-                upstream_writer.write(first_encrypted)
-            log.debug(
-                f"[client {client_addr}] Sent upstream (raw): "
-                f"{len(keys.header) + len(first_encrypted)} bytes"
-            )
-        await upstream_writer.drain()
-    except Exception as e:
-        log.error(f"[client {client_addr}] Tunnel setup error: {e}")
-        log.error(traceback.format_exc())
-        if upstream_writer:
-            upstream_writer.close()
-        writer.close()
-        return
-
-    unwrapper = TLSRecordUnwrapper() if cfg.is_fake_tls else None
-
-    # server_initial_appdata — это AppData-body из FakeTLS handshake (содержит
-    # часть HMAC-верификации), НЕ obfuscated2 данные. TDLib
-    # (``TlsInit::wait_hello_response``) также не использует эти байты после
-    # HMAC-проверки — response уходит из scope; скармливать unwrapper'у
-    # нельзя, это сломает его буфер.
-    if server_initial_appdata:
-        log.debug(
-            f"[client {client_addr}] Discarded server_initial_appdata: "
-            f"{len(server_initial_appdata)} bytes (handshake noise)"
-        )
-
-    log.info(f"[client {client_addr}] Tunnel established, starting relay")
-
-    async def client_to_upstream() -> None:
-        """Relay: client → obfuscated2 encrypt → upstream (TLS-wrapped если FakeTLS)."""
-        try:
-            while True:
-                try:
-                    data = await asyncio.wait_for(
-                        reader.read(65536), timeout=ACTIVITY_TIMEOUT_SECS
-                    )
-                except asyncio.TimeoutError:
-                    log.warning(
-                        f"[client {client_addr}] client->upstream: no activity for "
-                        f"{ACTIVITY_TIMEOUT_SECS}s — closing by activity timeout"
-                    )
-                    break
-                if not data:
-                    log.info(
-                        f"[client {client_addr}] Client closed connection (read returned empty)"
-                    )
-                    break
-                enc = keys.encryptor.update(data)
-                if cfg.is_fake_tls and tls_writer:
-                    upstream_writer.write(tls_writer.wrap(b"", enc))
-                else:
-                    upstream_writer.write(enc)
-                await upstream_writer.drain()
-                log.debug(f"[client {client_addr}] client->upstream: {len(data)} bytes")
-        except (ConnectionResetError, BrokenPipeError) as e:
-            log.debug(f"[client {client_addr}] client->upstream: {e}")
-        except Exception as e:
-            log.error(f"[client {client_addr}] client->upstream error: {e}")
-            log.error(traceback.format_exc())
-        finally:
             try:
-                upstream_writer.close()
-            except Exception:
-                pass
-
-    async def upstream_to_client() -> None:
-        """Relay: upstream → TLS-unwrap (если FakeTLS) → obfuscated2 decrypt → client."""
-        try:
-            while True:
-                try:
-                    data = await asyncio.wait_for(
-                        upstream_reader.read(65536), timeout=ACTIVITY_TIMEOUT_SECS
-                    )
-                except asyncio.TimeoutError:
-                    log.warning(
-                        f"[client {client_addr}] upstream->client: no activity for "
-                        f"{ACTIVITY_TIMEOUT_SECS}s — closing by activity timeout"
-                    )
-                    break
-                if not data:
-                    log.info(
-                        f"[client {client_addr}] Upstream closed connection (read returned empty)"
-                    )
-                    break
-                plain_wire = unwrapper.feed(data) if unwrapper else data
-                if plain_wire:
-                    dec = keys.decryptor.update(plain_wire)
-                    writer.write(dec)
-                    await writer.drain()
-                    log.debug(
-                        f"[client {client_addr}] upstream->client: {len(dec)} bytes"
-                    )
-        except (ConnectionResetError, BrokenPipeError) as e:
-            log.debug(f"[client {client_addr}] upstream->client: {e}")
-        except Exception as e:
-            log.error(f"[client {client_addr}] upstream->client error: {e}")
-            log.error(traceback.format_exc())
-        finally:
-            try:
+                dc = await guess_dc_id_async(target_host)
+            except ValueError as e:
+                log.error(f"[client {client_addr}] {e}")
                 writer.close()
-            except Exception:
-                pass
+                return
+            log.info(f"[client {client_addr}] DC ID resolved: {dc}")
 
-    try:
+        try:
+            log.info(
+                f"[client {client_addr}] Connecting to upstream {cfg.upstream_host}:{cfg.upstream_port}..."
+            )
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        cfg.upstream_host, cfg.upstream_port
+                    ),
+                    timeout=UPSTREAM_CONNECT_TIMEOUT_SECS,
+                )
+            except asyncio.TimeoutError:
+                raise OSError(
+                    f"upstream connect timeout ({UPSTREAM_CONNECT_TIMEOUT_SECS}s) "
+                    f"to {cfg.upstream_host}:{cfg.upstream_port}"
+                )
+            _apply_tcp_tuning(upstream_writer, client_addr)
+            log.info(f"[client {client_addr}] TCP connection to upstream established")
+        except OSError as e:
+            log.error(f"[client {client_addr}] Failed to connect to upstream: {e}")
+            writer.close()
+            return
+
+        tls_writer: TLSRecordWriter | None = None
+        server_initial_appdata = b""
+
+        try:
+            if cfg.is_fake_tls:
+                log.info(f"[client {client_addr}] Starting FakeTLS handshake...")
+                server_initial_appdata = await async_faketls_handshake(
+                    upstream_reader, upstream_writer, cfg.domain, cfg.secret_key,
+                    use_block_m=cfg.use_block_m, use_block_e=cfg.use_block_e,
+                )
+                tls_writer = TLSRecordWriter(send_ccs=cfg.send_ccs)
+                log.info(
+                    f"[client {client_addr}] FakeTLS handshake completed, "
+                    f"server_initial_appdata={len(server_initial_appdata)} bytes, "
+                    f"send_ccs={cfg.send_ccs}"
+                )
+
+            keys = build_obfuscated2_header(protocol_tag, dc, cfg.secret_key)
+            log.debug(
+                f"[client {client_addr}] Obfuscated2 header built: "
+                f"{len(keys.header)} bytes, tag={protocol_tag.hex()}, dc={dc}"
+            )
+
+            # Leftover (байты после transport-тега) шифруем и отправляем как есть —
+            # framing не транслируется, релеится end-to-end.
+            first_encrypted = keys.encryptor.update(leftover) if leftover else b""
+            log.debug(
+                f"[client {client_addr}] First encrypted chunk: {len(first_encrypted)} bytes"
+            )
+
+            if cfg.is_fake_tls:
+                wrapped = tls_writer.wrap(keys.header, first_encrypted)
+                upstream_writer.write(wrapped)
+                log.debug(
+                    f"[client {client_addr}] Sent upstream (TLS-wrapped): "
+                    f"{len(wrapped)} bytes"
+                )
+            else:
+                upstream_writer.write(keys.header)
+                if first_encrypted:
+                    upstream_writer.write(first_encrypted)
+                log.debug(
+                    f"[client {client_addr}] Sent upstream (raw): "
+                    f"{len(keys.header) + len(first_encrypted)} bytes"
+                )
+            await upstream_writer.drain()
+        except Exception as e:
+            log.error(f"[client {client_addr}] Tunnel setup error: {e}")
+            log.error(traceback.format_exc())
+            if upstream_writer:
+                upstream_writer.close()
+            writer.close()
+            return
+
+        unwrapper = TLSRecordUnwrapper() if cfg.is_fake_tls else None
+
+        # server_initial_appdata — это AppData-body из FakeTLS handshake (содержит
+        # часть HMAC-верификации), НЕ obfuscated2 данные. TDLib
+        # (``TlsInit::wait_hello_response``) также не использует эти байты после
+        # HMAC-проверки — response уходит из scope; скармливать unwrapper'у
+        # нельзя, это сломает его буфер.
+        if server_initial_appdata:
+            log.debug(
+                f"[client {client_addr}] Discarded server_initial_appdata: "
+                f"{len(server_initial_appdata)} bytes (handshake noise)"
+            )
+
+        log.info(f"[client {client_addr}] Tunnel established, starting relay")
+
+        async def client_to_upstream() -> None:
+            """Relay: client → obfuscated2 encrypt → upstream (TLS-wrapped если FakeTLS)."""
+            try:
+                while True:
+                    try:
+                        data = await asyncio.wait_for(
+                            reader.read(65536), timeout=ACTIVITY_TIMEOUT_SECS
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            f"[client {client_addr}] client->upstream: no activity for "
+                            f"{ACTIVITY_TIMEOUT_SECS}s — closing by activity timeout"
+                        )
+                        break
+                    if not data:
+                        log.info(
+                            f"[client {client_addr}] Client closed connection (read returned empty)"
+                        )
+                        break
+                    enc = keys.encryptor.update(data)
+                    if cfg.is_fake_tls and tls_writer:
+                        upstream_writer.write(tls_writer.wrap(b"", enc))
+                    else:
+                        upstream_writer.write(enc)
+                    await upstream_writer.drain()
+                    log.debug(f"[client {client_addr}] client->upstream: {len(data)} bytes")
+            except (ConnectionResetError, BrokenPipeError) as e:
+                log.debug(f"[client {client_addr}] client->upstream: {e}")
+            except Exception as e:
+                log.error(f"[client {client_addr}] client->upstream error: {e}")
+                log.error(traceback.format_exc())
+            finally:
+                try:
+                    upstream_writer.close()
+                except Exception:
+                    pass
+
+        async def upstream_to_client() -> None:
+            """Relay: upstream → TLS-unwrap (если FakeTLS) → obfuscated2 decrypt → client."""
+            try:
+                while True:
+                    try:
+                        data = await asyncio.wait_for(
+                            upstream_reader.read(65536), timeout=ACTIVITY_TIMEOUT_SECS
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            f"[client {client_addr}] upstream->client: no activity for "
+                            f"{ACTIVITY_TIMEOUT_SECS}s — closing by activity timeout"
+                        )
+                        break
+                    if not data:
+                        log.info(
+                            f"[client {client_addr}] Upstream closed connection (read returned empty)"
+                        )
+                        break
+                    plain_wire = unwrapper.feed(data) if unwrapper else data
+                    if plain_wire:
+                        dec = keys.decryptor.update(plain_wire)
+                        writer.write(dec)
+                        await writer.drain()
+                        log.debug(
+                            f"[client {client_addr}] upstream->client: {len(dec)} bytes"
+                        )
+            except (ConnectionResetError, BrokenPipeError) as e:
+                log.debug(f"[client {client_addr}] upstream->client: {e}")
+            except Exception as e:
+                log.error(f"[client {client_addr}] upstream->client error: {e}")
+                log.error(traceback.format_exc())
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
         await asyncio.gather(
             client_to_upstream(), upstream_to_client(), return_exceptions=True
         )
+    except asyncio.CancelledError:
+        log.info(f"[client {client_addr}] Connection interrupted (server shutting down)")
+        raise
     finally:
         log.info(f"[client {client_addr}] Connection closed")
         try:
@@ -1745,10 +1758,152 @@ async def _handle_client(
             pass
 
 
+# ============================================================================
+# Корректное (graceful) завершение
+# ============================================================================
+#
+# Идея: не полагаться на штатное поведение asyncio.run() при SIGINT
+# (отмена главной задачи → CancelledError всплывает из serve_forever() →
+# asyncio.run() заново поднимает KeyboardInterrupt — именно так получается
+# трассировка из отчёта). Вместо этого мы сами перехватываем SIGINT/SIGTERM
+# через loop.add_signal_handler, сами останавливаем listener и сами ждём
+# уже открытые соединения — run_bridge() в итоге просто возвращается,
+# без исключений, без трассировки, с exit code 0.
+
+
+def _make_connection_tracker(
+    cfg: BridgeConfig,
+) -> tuple[
+    Callable[[asyncio.StreamReader, asyncio.StreamWriter], None],
+    set[asyncio.Task],
+]:
+    """Строит client_connected_cb для asyncio.start_server и множество,
+    в котором будет отслеживаться каждая созданная задача-обработчик.
+
+    Если просто передать асинхронный коллбэк в start_server, сервер сам
+    оборачивает его в Task — но нигде не сохраняет ссылку. Это значит, что
+    отменить конкретное соединение снаружи (например, при shutdown) нечем:
+    задачи просто повиснут до собственного естественного завершения.
+    Здесь мы регистрируем каждую задачу явно и убираем её из множества по
+    завершении (add_done_callback), чтобы _shutdown_server ниже видел
+    актуальный список того, что ещё нужно закрыть.
+    """
+    active: set[asyncio.Task] = set()
+
+    def _client_connected(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = asyncio.create_task(_handle_client(reader, writer, cfg))
+        active.add(task)
+        task.add_done_callback(active.discard)
+
+    return _client_connected, active
+
+
+async def _shutdown_server(
+    server: asyncio.Server,
+    active_connections: set[asyncio.Task],
+    *,
+    grace: float = SHUTDOWN_GRACE_SECS,
+) -> None:
+    """Останавливает listener и корректно закрывает уже открытые соединения.
+
+    server.close() — синхронный вызов: он немедленно снимает listening-сокет
+    с event loop'а (см. Server.close() → loop._stop_serving()), так что
+    новые подключения становятся невозможны ещё до какого-либо await. Его
+    НЕ нужно (и в данном случае нельзя!) дожидаться через wait_closed()
+    прямо здесь: начиная с Python 3.12.1 wait_closed() ждёт закрытия ещё и
+    всех активных соединений сервера — а мы их пока не отменяли. Если
+    вызвать await server.wait_closed() до task.cancel(), получится
+    deadlock: сервер ждёт соединения, а соединения ждут отмены, которая
+    произойдёт только после wait_closed(). Поэтому здесь порядок другой:
+    сначала close() (снимает listener), потом cancel() всех отслеживаемых
+    задач, и только потом ждём их завершения через asyncio.wait — уже
+    закрытые сокеты для wait_closed() дальше не имеют значения, так что
+    отдельно вызывать его не требуется.
+
+    Каждая отменённая задача — это _handle_client(), у которого единый
+    try/except CancelledError/finally на весь пайплайн, так что оба сокета
+    (клиентский и upstream) гарантированно закрываются на любой стадии
+    отмены. grace — верхняя граница ожидания на случай, если какая-то
+    задача всё же зависнет и не среагирует на отмену вовремя.
+    """
+    server.close()
+
+    if not active_connections:
+        return
+
+    log.info(
+        f"Closing {len(active_connections)} active connection(s) "
+        f"(up to {grace:.0f}s)..."
+    )
+    for task in active_connections:
+        task.cancel()
+
+    _done, pending = await asyncio.wait(active_connections, timeout=grace)
+    if pending:
+        log.warning(
+            f"{len(pending)} connection(s) did not close within {grace:.0f}s "
+            f"and were left running to shut down on their own"
+        )
+
+
+def _install_shutdown_handler(stop_event: asyncio.Event) -> None:
+    """Регистрирует SIGINT/SIGTERM: по сигналу выставляется stop_event,
+    что будит run_bridge() и запускает штатную процедуру остановки.
+
+    Обрабатываем сигнал сами (через loop.add_signal_handler), а не отдаём
+    его дефолтному поведению asyncio.run() — так у нас появляется точка,
+    где можно сперва закрыть listener, затем дождаться уже открытых
+    соединений и только после этого выйти, вместо мгновенного разрыва.
+
+    Повторный сигнал во время завершения — сигнал того, что что-то не
+    отвечает на отмену; в этом случае выходим немедленно (os._exit), не
+    дожидаясь ничего, — это осознанный компромисс в пользу отзывчивости
+    Ctrl+C, а не потери данных (relay всё равно не буферизует).
+
+    На Windows add_signal_handler не реализован (NotImplementedError) —
+    откатываемся на classic signal.signal(), которое ловит хотя бы
+    SIGINT/Ctrl+C; SIGTERM на Windows не является настоящим сигналом ОС,
+    поэтому там не обрабатывается ни тем, ни другим способом.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _on_signal(sig_name: str) -> None:
+        if stop_event.is_set():
+            log.warning(f"Second {sig_name} received — forcing immediate exit")
+            os._exit(130 if sig_name == "SIGINT" else 143)
+        log.info(
+            f"{sig_name} received, shutting down gracefully "
+            f"(Ctrl+C again to force-quit)..."
+        )
+        stop_event.set()
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _on_signal, sig.name)
+    except NotImplementedError:
+
+        def _sync_handler(signum: int, _frame: object) -> None:
+            loop.call_soon_threadsafe(_on_signal, signal.Signals(signum).name)
+
+        signal.signal(signal.SIGINT, _sync_handler)
+
+
 async def run_bridge(cfg: BridgeConfig) -> None:
-    """Start a blocking SOCKS5 server (CLI mode)."""
+    """Start a blocking SOCKS5 server (CLI mode).
+
+    Runs until SIGINT/SIGTERM, then shuts down gracefully: stops accepting
+    new connections, cancels and waits (up to SHUTDOWN_GRACE_SECS) for
+    already-open ones, and returns normally — no exception leaves this
+    function as part of a normal shutdown.
+    """
+    stop_event = asyncio.Event()
+    _install_shutdown_handler(stop_event)
+
+    client_connected_cb, active_connections = _make_connection_tracker(cfg)
     server = await asyncio.start_server(
-        lambda r, w: _handle_client(r, w, cfg), cfg.listen_host, cfg.listen_port
+        client_connected_cb, cfg.listen_host, cfg.listen_port
     )
     transport_name = (
         "padded intermediate (0xDD)"
@@ -1769,8 +1924,11 @@ async def run_bridge(cfg: BridgeConfig) -> None:
         f"send_ccs={cfg.send_ccs}, use_block_m={cfg.use_block_m}, "
         f"use_block_e={cfg.use_block_e}"
     )
-    async with server:
-        await server.serve_forever()
+
+    await stop_event.wait()
+    log.info("Stopping listener, no new connections will be accepted...")
+    await _shutdown_server(server, active_connections)
+    log.info("Bridge stopped.")
 
 
 def is_mtproto_link(url: str) -> bool:
@@ -1807,7 +1965,13 @@ def needs_padded_transport(url: str) -> bool:
     return link.expected_tag == TAG_PADDED_INTERMEDIATE
 
 
-_running_servers: dict[asyncio.Server, asyncio.Task] = {}
+# Сервер → множество активных задач-обработчиков (см. _make_connection_tracker).
+# Раньше здесь хранилась Task от server.serve_forever(), что позволяло
+# остановить listener (закрытие serve_forever() каскадно вызывает
+# server.close()), но никак не помогало закрыть уже открытые клиентские
+# соединения — они просто оставались висеть. Теперь вместо этого хранится
+# набор именно клиентских задач, и stop_all_bridges может дождаться каждой.
+_running_servers: dict[asyncio.Server, set[asyncio.Task]] = {}
 
 
 async def start_local_bridge(
@@ -1823,7 +1987,9 @@ async def start_local_bridge(
 
     Intended for embedding into an application (e.g. before starting a
     Pyrogram/Kurigram client). To stop all background bridges, call
-    :func:`stop_all_bridges`.
+    :func:`stop_all_bridges` — e.g. from your own SIGINT/SIGTERM handler or
+    shutdown path; this module does not install signal handlers of its own
+    in library mode, so as not to clobber a host application's handlers.
 
     Args:
         tg_link: ``tg://proxy?server=...&port=...&secret=...``.
@@ -1852,29 +2018,32 @@ async def start_local_bridge(
         use_block_m=use_block_m,
         use_block_e=use_block_e,
     )
-    server = await asyncio.start_server(
-        lambda r, w: _handle_client(r, w, cfg), listen_host, listen_port
-    )
+    client_connected_cb, active_connections = _make_connection_tracker(cfg)
+    server = await asyncio.start_server(client_connected_cb, listen_host, listen_port)
     actual_port = server.sockets[0].getsockname()[1]
 
-    task = asyncio.create_task(server.serve_forever())
-    _running_servers[server] = task
+    _running_servers[server] = active_connections
 
     return actual_port
 
 
 async def stop_all_bridges() -> None:
-    """Gracefully stop all background bridges started via :func:`start_local_bridge`."""
+    """Gracefully stop all background bridges started via :func:`start_local_bridge`.
+
+    For each bridge: stops accepting new connections, then cancels and
+    waits (up to ``SHUTDOWN_GRACE_SECS`` per bridge, all bridges in
+    parallel) for already-open client connections to close their sockets.
+    """
     if not _running_servers:
         return
 
-    tasks = []
-    for server, task in list(_running_servers.items()):
-        server.close()
-        task.cancel()
-        tasks.append(task)
-
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(
+        *(
+            _shutdown_server(server, active_connections)
+            for server, active_connections in _running_servers.items()
+        ),
+        return_exceptions=True,
+    )
     _running_servers.clear()
 
 
@@ -1929,7 +2098,15 @@ def main() -> None:
         use_block_m=not args.no_block_m,
         use_block_e=not args.no_block_e,
     )
-    asyncio.run(run_bridge(cfg))
+    try:
+        asyncio.run(run_bridge(cfg))
+    except KeyboardInterrupt:
+        # Защитная сетка, а не основной механизм: run_bridge() сама ловит
+        # SIGINT через loop.add_signal_handler и завершается без исключений.
+        # Сюда попадаем только если Ctrl+C пришёл до того, как обработчик
+        # успел зарегистрироваться (узкое окно на самом старте), или на
+        # платформе, где add_signal_handler недоступен для part сигналов.
+        print("\nInterrupted before startup completed.")
 
 
 if __name__ == "__main__":
