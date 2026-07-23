@@ -20,9 +20,8 @@
 """
 Local MTProto Proxy bridge.
 
-Starts a SOCKS5 server on 127.0.0.1:<port> and transparently tunnels
-bytes between the client (Kurigram) and Telegram via an MTProto proxy
-(FakeTLS or obfuscated2).
+Starts a SOCKS5 server on 127.0.0.1:<port> and tunnels bytes between the
+client (Kurigram) and Telegram via an MTProto proxy (FakeTLS or obfuscated2).
 
 Transport framing is determined by the secret type (mirrors TDLib
 ``ObfuscatedTransport::init`` / ``ProxySecret``):
@@ -32,17 +31,8 @@ Transport framing is determined by the secret type (mirrors TDLib
    - bare 16 bytes            → obfuscated2 + abridged  (0xEFEFEFEF)
 
 The bridge does NOT translate framing: the client must use the transport
-matching the secret (``TCPIntermediatePadded`` for ee/dd, ``TCPAbridged`` for bare
-16-byte secrets). After the handshake, bytes are relayed end-to-end as-is.
-
-Key features:
-    - server_initial_appdata (FakeTLS handshake noise) is discarded;
-    - the transport tag for obfuscated2 is taken from the secret;
-    - CCS (TDLib ``first_prefix``) is sent by default;
-    - incremental parser for ServerHello and TLS Application Data;
-    - 30-minute activity timeout;
-    - reverse IP → DC ID mapping via a built-in table (TDLib
-      ConnectionCreator::get_default_dc_options + getConfig snapshot).
+matching the secret (``TCPIntermediatePadded`` for ee/dd, ``TCPAbridged`` for
+bare 16-byte secrets). After the handshake, bytes are relayed end-to-end as-is.
 """
 
 from __future__ import annotations
@@ -102,12 +92,12 @@ _TCP_KEEPALIVE_PROBES = 3  # проб до разрыва
 
 
 def _apply_tcp_tuning(writer: asyncio.StreamWriter, peer_label: object) -> None:
-    """Включает TCP_NODELAY + keepalive на сокете writer'а.
+    """Включает TCP_NODELAY + keepalive на сокете writer'а (best-effort).
 
-    Без TCP_NODELAY мелкие MTProto-фреймы (ack/ping/rpc_result)
-    коагулируются ~40ms из-за Nagle. Keepalive защищает от зависших
-    NAT-сессий. Опции ставятся best-effort: недоступность опции на
-    конкретной платформе логируется warning, но не рвёт соединение.
+    TCP_NODELAY критичен для мелких MTProto-фреймов (ack/ping/rpc_result) —
+    иначе Nagle коагулирует их ~40ms. Keepalive защищает от зависших
+    NAT-сессий. Недоступность опции на конкретной платформе логируется, но
+    не рвёт соединение.
     """
     sock = writer.get_extra_info("socket")
     if sock is None:
@@ -139,29 +129,18 @@ def _apply_tcp_tuning(writer: asyncio.StreamWriter, peer_label: object) -> None:
 # Activity timeout для relay
 # ============================================================================
 
-# За этот интервал через соединение должен пройти хотя бы один байт,
-# иначе оба направления разрываются. Защищает от зависших клиентов,
-# зависших upstream-прокси и утечки file descriptors при idle-коннектах.
+# Хоть один байт за этот интервал, иначе оба направления разрываются.
+# Защита от зависших клиентов/upstream и утечки FD при idle-коннектах.
 ACTIVITY_TIMEOUT_SECS = 1800  # 30 минут
 
-# Таймаут на каждый readexactly внутри SOCKS5 handshake (greeting/methods/
-# request/addr/port). Защищает от клиентов, которые установили TCP, но
-# не присылают (или присылают медленно) байты протокола — без этого FD
-# висит бесконечно (slowloris-поверхность).
+# Таймаут на каждый readexactly внутри SOCKS5 handshake (slowloris-защита).
 SOCKS5_HANDSHAKE_TIMEOUT_SECS = 15.0
 
-# Таймаут на установление TCP-соединения к upstream-прокси. Без этого
-# обрыв маршрута (молчаливый drop без RST) вешает корутину на OS-level
-# TCP connect timeout (~127 c на Linux). 15 c достаточно для любой
-# реальной сети; если upstream так далеко — что-то не так.
+# Таймаут на TCP-connect к upstream (молчаливый drop без RST иначе вешает
+# корутину на OS-level timeout ~127 c).
 UPSTREAM_CONNECT_TIMEOUT_SECS = 5.0
 
-# При остановке сервера (SIGINT/SIGTERM) уже открытые клиентские соединения
-# отменяются и им даётся это время на то, чтобы отработать свои
-# except/finally и закрыть сокеты. Отмена в asyncio доставляется на
-# ближайшей точке await, так что обычно всё укладывается в миллисекунды;
-# таймаут — просто страховка от зависшей корутины, чтобы shutdown не мог
-# заблокироваться навсегда.
+# Грейс-период для уже открытых соединений при остановке сервера.
 SHUTDOWN_GRACE_SECS = 5.0
 
 
@@ -169,14 +148,11 @@ SHUTDOWN_GRACE_SECS = 5.0
 # Разбор tg://proxy?server=...&port=...&secret=... и секрета
 # ============================================================================
 
-# Transport-теги (см. ObfuscatedTransport::init в td/mtproto/TcpTransport.cpp).
+# Transport-теги (см. ObfuscatedTransport::init в TDLib).
 TAG_ABRIDGED = b"\xef\xef\xef\xef"
 TAG_PADDED_INTERMEDIATE = b"\xdd\xdd\xdd\xdd"
 
-# TDLib ProxySecret::MAX_DOMAIN_LENGTH (td/mtproto/ProxySecret.h:18).
-# Домен длиннее обрезается в ProxySecret::get_domain() → substr(0, MAX_DOMAIN_LENGTH).
-# Защищает от переполнения TLS Hello (мостовая проверка _CLIENT_HELLO_LIMIT = 2048
-# поймала бы это позже, но без понятного сообщения о причине).
+# TDLib ProxySecret::MAX_DOMAIN_LENGTH. Домен длиннее обрезается в get_domain().
 _MAX_DOMAIN_LENGTH = 182
 
 
@@ -194,20 +170,16 @@ class ProxyLink(NamedTuple):
 def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
     """Parse an MTProto secret in hex or base64url form.
 
-    TDLib semantics (td/mtproto/ProxySecret.cpp:29-46 ``ProxySecret::from_binary``,
-    td/mtproto/TcpTransport.cpp ``ObfuscatedTransport::init``):
+    Semantics (mirrors TDLib ``ProxySecret::from_binary`` +
+    ``ObfuscatedTransport::init``):
         - bare 16 bytes            → obfuscated2 + abridged
-        - 0xEE + 16 + domain (len ≥ 18, domain ≥ 1 byte)
-                                    → FakeTLS + padded intermediate
-        - 0xDD + 16 (len == 17)
-                                    → obfuscated2 + padded intermediate
+        - 0xEE + 16 + domain (≥18) → FakeTLS + padded intermediate
+        - 0xDD + 16 (len == 17)    → obfuscated2 + padded intermediate
 
-    Empty secret (TDLib ``ProxySecret`` with size 0, plain TCP) is NOT
-    supported by the bridge.
+    Empty secret (TDLib plain TCP, ProxySecret size 0) is NOT supported.
 
     Raises:
-        ValueError: empty secret, unrecognized format, or secret length
-            that does not match any of the three valid TDLib patterns.
+        ValueError: empty secret, unrecognized format, or invalid length.
     """
     s = secret_str.strip()
     if all(c in "0123456789abcdefABCDEF" for c in s) and len(s) % 2 == 0:
@@ -227,16 +199,13 @@ def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
         return raw, "", False, TAG_ABRIDGED
 
     if raw[0] == 0xEE:
-        # TDLib: ProxySecret::emulate_tls() → secret.size() >= 17 (0xEE + 16 + domain).
-        # ProxySecret::from_binary (ProxySecret.cpp:39) принимает size >= 18
-        # (домен >= 1 байт). Мост следует TDLib-семантике.
+        # TDLib: ProxySecret::emulate_tls() / from_binary — size ≥ 18.
         if len(raw) < 18:
             raise ValueError(
                 f"FakeTLS (ee) secret must be ≥18 bytes "
                 f"(0xEE + 16-byte key + ≥1-byte domain), got {len(raw)}"
             )
-        # TDLib: ProxySecret::get_domain() returns secret_.substr(17),
-        # (ProxySecret.h:18).
+        # TDLib: get_domain() возвращает secret_.substr(17).
         if len(raw) > 17 + _MAX_DOMAIN_LENGTH:
             raise ValueError(
                 f"FakeTLS domain too long ({len(raw) - 17} bytes), "
@@ -253,7 +222,7 @@ def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
         return raw[1:17], domain, True, TAG_PADDED_INTERMEDIATE
 
     if raw[0] == 0xDD:
-        # TDLib: ProxySecret::use_random_padding() → secret.size() >= 17 (0xDD + 16)
+        # TDLib: use_random_padding() → secret.size() == 17.
         if len(raw) != 17:
             raise ValueError(
                 f"dd-secret must be exactly 17 bytes (0xDD + 16-byte key), "
@@ -358,8 +327,7 @@ def _prepare_client_hello_rules(
     из TDLib, td/mtproto/TlsInit.cpp:139-241).
 
     Args:
-        use_block_m: включить блок M (Kyber-like key share) — для прокси
-            с полным TLS-парсером.
+        use_block_m: включить блок M (Kyber-like key share).
         use_block_e: включить блок E (random extra в encrypted_server_name).
     """
 
@@ -487,8 +455,7 @@ def _prepare_client_hello_rules(
 
 
 def _prepare_greases() -> bytes:
-    """Генерирует 8 байт GREASE-значений (порт ``Grease::init`` из TDLib,
-    td/mtproto/TlsInit.cpp:28-38)."""
+    """Генерирует 8 байт GREASE-значений (порт ``Grease::init`` из TDLib)."""
     result = bytearray(secrets.token_bytes(_MAX_GREASE))
     for i in range(_MAX_GREASE):
         result[i] = (result[i] & 0xF0) + 0x0A
@@ -499,8 +466,7 @@ def _prepare_greases() -> bytes:
 
 
 class _HelloPart:
-    """Рендерер блоков ClientHello (порт ``TlsHelloStore::do_op`` из TDLib,
-    td/mtproto/TlsInit.cpp:386-508)."""
+    """Рендерер блоков ClientHello (порт ``TlsHelloStore::do_op`` из TDLib)."""
 
     def __init__(self, domain: bytes, greases: bytes):
         self._domain = domain
@@ -611,8 +577,7 @@ class _HelloPart:
             self._error = True
 
     def _render_block_M(self) -> None:
-        """Рендерит Kyber-like блок M (порт ``Op::MlKem768Key`` из TDLib,
-        td/mtproto/TlsInit.cpp:441-451)."""
+        """Рендерит Kyber-like блок M (порт ``Op::MlKem768Key`` из TDLib)."""
         k_elements = 384
         k_added = 32
         output_len = k_elements * 3 + k_added  # 1184
@@ -635,7 +600,7 @@ class _HelloPart:
     def _render_padding(self) -> None:
         """Дополняет ClientHello до 513 байт extension-записью с zero padding.
 
-        Порт ``Op::Padding`` из TDLib (td/mtproto/TlsInit.cpp:495-504).
+        Порт ``Op::Padding`` из TDLib.
         """
         length = len(self._result)
         if length < 513:
@@ -769,18 +734,16 @@ async def async_faketls_handshake(
     """Асинхронный клиентский FakeTLS handshake.
 
     Отправляет ClientHello, читает ServerHello + CCS + AppData, проверяет
-    server-side HMAC-SHA256. Соответствует TDLib ``TlsInit::send_hello``
-    и ``TlsInit::wait_hello_response`` (td/mtproto/TlsInit.cpp:599-648).
+    server-side HMAC-SHA256 (соответствует TDLib ``TlsInit::send_hello`` /
+    ``wait_hello_response``).
 
     Args:
         reader: поток чтения от upstream-прокси.
         writer: поток записи к upstream-прокси.
         domain: SNI-домен из ee-секрета.
         secret_key: 16-байтный секрет прокси.
-        use_block_m: флаг блока M (Kyber-like key share) в ClientHello,
-            пробрасывается в :func:`_prepare_client_hello`.
-        use_block_e: флаг блока E в ClientHello, пробрасывается
-            в :func:`_prepare_client_hello`.
+        use_block_m: флаг блока M (Kyber-like key share) в ClientHello.
+        use_block_e: флаг блока E в ClientHello.
 
     Returns:
         Байты первого AppData body от сервера (может быть пустым).
@@ -955,8 +918,8 @@ class TLSRecordWriter:
         """Упаковывает ``prefix`` + ``data`` в TLS Application Data records.
 
         ``prefix`` — необязательные служебные байты (например, остаток
-        заголовка obfuscated2), которые приклеиваются к началу ``data``
-        в первой TLS-записи. ``data`` дробится на куски не более
+        заголовка obfuscated2), которые приклеиваются к началу ``data`` в
+        первой TLS-записи. ``data`` дробится на куски не более
         ``_MAX_TLS_PACKET_LENGTH`` байт.
 
         Returns:
@@ -1017,10 +980,10 @@ _SERVER_HEADER = b"\x17\x03\x03"
 class TLSRecordUnwrapper:
     """Инкрементальный парсер TLS Application Data records.
 
-    Принимает произвольные порции байт через :meth:`feed`, разбирает
-    TLS record framing (5-байтный header + payload) и возвращает
-    «чистый» payload AppData records. Alert / неожиданный CCS /
-    неизвестные типы рвут соединение.
+    Принимает произвольные порции байт через :meth:`feed`, разбирает TLS
+    record framing (5-байтный header + payload) и возвращает «чистый»
+    payload AppData records. Alert / неожиданный CCS / неизвестные типы
+    рвут соединение.
     """
 
     def __init__(self) -> None:
@@ -1031,8 +994,7 @@ class TLSRecordUnwrapper:
     def feed(self, data: bytes) -> bytes:
         """Добавляет ``data`` во внутренний буфер и возвращает накопленный payload.
 
-        Накопленные неполные record'ы остаются в буфере до следующих
-        вызовов :meth:`feed`.
+        Накопленные неполные record'ы остаются в буфере до следующих вызовов.
 
         Raises:
             ConnectionError: получен TLS Alert, неожиданный post-hello CCS
@@ -1119,9 +1081,9 @@ _RESERVED_FIRST4 = {
 def _generate_init() -> bytes:
     """Генерирует 64-байтный init packet для obfuscated2.
 
-    Перебирает случайные 64-байтные блоки до тех пор, пока первый байт
-    ≠ 0xEF, первые 4 байта не входят в ``_RESERVED_FIRST4``, а байты
-    4..8 не равны нулю (требования ``isGoodStartNonce``).
+    Перебирает случайные 64-байтные блоки до тех пор, пока первый байт ≠ 0xEF,
+    первые 4 байта не входят в ``_RESERVED_FIRST4``, а байты 4..8 не равны
+    нулю (требования ``isGoodStartNonce``).
     """
     while True:
         init = bytearray(secrets.token_bytes(64))
@@ -1159,17 +1121,16 @@ def build_obfuscated2_header(
         protocol_tag: 4-байтный транспортный тег (``TAG_ABRIDGED`` или
             ``TAG_PADDED_INTERMEDIATE``). Записывается в байты 56..60 init.
         dc: ID дата-центра как signed int16. Положительный для обычных DC,
-            отрицательный для CDN (TDLib: ``DcId::external()`` + ``DcOption::Flags::Cdn``,
-            кодируется как ``-dc_id`` в int16 protocolDcId).
+            отрицательный для CDN (TDLib: ``DcId::external()`` + ``DcOption::Flags::Cdn``).
         secret: 16-байтный секрет прокси (подмешивается в ключи AES через
-            SHA-256). ``None`` — без secret-mixing (для совместимости).
+            SHA-256). ``None`` — без secret-mixing.
 
     Raises:
         ValueError: ``dc`` вне диапазона signed int16.
 
     Returns:
-        :class:`Obfuscated2Keys`: 64-байтный заголовок + AES-CTR
-        контексты для направлений client→server и server→client.
+        :class:`Obfuscated2Keys`: 64-байтный заголовок + AES-CTR контексты
+        для направлений client→server и server→client.
     """
     # *reinterpret_cast<int16*>(nonce+60) = _protocolDcId — signed int16.
     if not -32768 <= dc <= 32767:
@@ -1216,8 +1177,8 @@ def detect_client_transport_tag(first_bytes: bytes) -> tuple[bytes, int]:
         ``first_bytes`` он занимает.
 
     Raises:
-        ValueError: тег не распознан. Валидация тега против ожидаемого
-            из секрета делается отдельно в :func:`_handle_client`.
+        ValueError: тег не распознан. Валидация тега против ожидаемого из
+            секрета делается отдельно в :func:`_handle_client`.
     """
     if first_bytes[:4] == TAG_PADDED_INTERMEDIATE:
         return TAG_PADDED_INTERMEDIATE, 4
@@ -1231,32 +1192,20 @@ def detect_client_transport_tag(first_bytes: bytes) -> tuple[bytes, int]:
 
 
 # Built-in Telegram DC IPs. Источник: TDLib ``ConnectionCreator::get_default_dc_options``
-# (td/telegram/net/ConnectionCreator.cpp:1257-1277) + актуальный getConfig dcOptions
-# (snapshot 2026-07).
+# + актуальный getConfig dcOptions (snapshot 2026-07).
 #
-# Мост — SOCKS5-прокси, из которого DC ID не виден напрямую, поэтому
-# делается reverse-mapping target_host → DC по IP-таблице.
+# Мост — SOCKS5-прокси, из которого DC ID не виден напрямую, поэтому делается
+# reverse-mapping target_host → DC по IP-таблице.
 #
-# Production DCs: IDs 1-5. Test DCs: TDLib is_test_dc() → dc_id + 10000.
+# Production DCs: IDs 1-5. Test DCs: dc_id + 10000.
 # IPv6 записаны в canonical compressed form (ipaddress.ip_address).
 #
-# Семантика DcOption-флагов (TL schema help.getConfig → dcOptions):
-#   media_only  — endpoint только для upload.getFile/getCdnFile (медиа).
-#                 Auth/API там не работает.
-#   cdn=True    — CDN DC, отдельный протокол с fileToken-based handshake.
-#                 protocolDcId = -dc_id (см. KNOWN_CDN_IPS).
-#   static=True — стабильный IP, предпочтителен для долгих сессий.
-#   tcpo_only   — TCP-only; у всех записей здесь False.
-#
 # ВНИМАНИЕ — расхождение с TDLib по protocolDcId для media_only:
-#   TDLib (ConnectionCreator.cpp:634) кодирует media_only DC как
-#   `is_media_only() ? -int_dc_id : int_dc_id`, т.е. ОТРИЦАТЕЛЬНЫЙ.
-#   Мост кодирует media_only DC как ПОЛОЖИТЕЛЬНЫЙ (см. значения ниже с
-#   media_only=True) — это намеренное решение, проверенное на практике.
-#   Если прокси, реализованный строго по TDLib-спецификации, начнёт
-#   отклонять соединения к media_only endpoints, поменяйте значения
-#   149.154.167.222 / 2001:67c:4e8:f002::b / 149.154.165.120 /
-#   2001:67c:4e8:f004::b на отрицательные (-2 и -4 соответственно).
+#   TDLib кодирует media_only DC как ОТРИЦАТЕЛЬНЫЙ; мост кодирует как
+#   ПОЛОЖИТЕЛЬНЫЙ — это намеренное решение, проверенное на практике.
+#   Если строгий TDLib-прокси начнёт отклонять соединения к media_only
+#   endpoints, поменяйте значения 149.154.167.222 / 2001:67c:4e8:f002::b /
+#   149.154.165.120 / 2001:67c:4e8:f004::b на отрицательные (-2 и -4).
 KNOWN_DC_IPS: dict[str, int] = {
     # ===== DC 1 — Miami (auth + API) =====
     "149.154.175.50": 1,  # TDLib bootstrap (legacy)
@@ -1292,12 +1241,10 @@ KNOWN_DC_IPS: dict[str, int] = {
     "2001:b28:f23d:f003::e": 10003,
 }
 
-# CDN DCs (help.getConfig dcOptions с cdn=True). Telegram использует их для
-# upload.getCdnFile-редиректов — отдельный протокол с fileToken-based auth,
-# несовместимый с обычным MTProto handshake. protocolDcId кодируется как
-# отрицательный int16 (TDLib: DcId::external() → protocolDcId = -dc_id). Мост релеит байты
-# end-to-end после obfuscated2 handshake; CDN-fileToken handshake делает
-# клиент через туннель.
+# CDN DCs (help.getConfig dcOptions с cdn=True). protocolDcId кодируется как
+# отрицательный int16 (TDLib: DcId::external() → protocolDcId = -dc_id).
+# Мост релеит байты end-to-end после obfuscated2 handshake; CDN-fileToken
+# handshake делает клиент через туннель.
 KNOWN_CDN_IPS: dict[str, int] = {
     # DC 203 — CDN (IPv4 + IPv6)
     "91.105.192.100": 203,
@@ -1320,22 +1267,20 @@ async def guess_dc_id_async(target_host: str) -> int:
     """Определяет Data Center ID по IP-адресу или hostname.
 
     Сначала пробует прямой lookup в :data:`KNOWN_CDN_IPS` /
-    :data:`KNOWN_DC_IPS`. Если ``target_host`` — hostname, делает
-    DNS-resolve и ищет полученные IP в тех же таблицах.
+    :data:`KNOWN_DC_IPS`. Если ``target_host`` — hostname, делает DNS-resolve
+    и ищет полученные IP в тех же таблицах.
 
     Args:
         target_host: IP-адрес или hostname клиента (из SOCKS5 CONNECT).
 
     Returns:
         Положительный DC ID (1..5, 10001..10003) для обычных/test DC,
-        отрицательный (-203) для CDN DC (сигнал obfuscated2-прокси
-        маршрутизировать на CDN-инфраструктуру).
+        отрицательный (-203) для CDN DC.
 
     Raises:
-        ValueError: IP не найден в таблицах или DNS-resolve упал.
-            Fallback на DC 2 НЕ делается — неправильный DC ID хуже
-            отказа (MTProto handshake падает с криптической ошибкой).
-            Escape hatch: ``--dc-id-override``.
+        ValueError: IP не найден в таблицах или DNS-resolve упал. Fallback
+            на DC 2 НЕ делается — неправильный DC ID хуже отказа. Escape
+            hatch: ``--dc-id-override``.
     """
     normalized = _normalize_ip(target_host)
 
@@ -1416,10 +1361,9 @@ async def _socks5_handshake(
     рвётся; прочие отклонения рвут соединение без reply.
 
     Raises:
-        ConnectionError: клиент требует auth, неподдерживаемый ATYP,
-            таймаут чтения.
-        asyncio.IncompleteReadError: клиент закрыл соединение до
-            завершения handshake.
+        ConnectionError: клиент требует auth, неподдерживаемый ATYP, таймаут.
+        asyncio.IncompleteReadError: клиент закрыл соединение до завершения
+            handshake.
     """
 
     async def _rx(n: int, what: str) -> bytes:
@@ -1539,8 +1483,7 @@ async def _handle_client(
         leftover = first_chunk[consumed:]
 
         # Валидация: транспорт клиента должен соответствовать типу секрета.
-        # Нарушение ломает obfuscated2 handshake (тег сверяется сервером)
-        # и traffic-shaping.
+        # Нарушение ломает obfuscated2 handshake (тег сверяется сервером).
         tag_names = {
             TAG_ABRIDGED: "abridged (0xEF)",
             TAG_PADDED_INTERMEDIATE: "padded intermediate (0xDD)",
@@ -1654,11 +1597,10 @@ async def _handle_client(
 
         unwrapper = TLSRecordUnwrapper() if cfg.is_fake_tls else None
 
-        # server_initial_appdata — это AppData-body из FakeTLS handshake (содержит
-        # часть HMAC-верификации), НЕ obfuscated2 данные. TDLib
-        # (``TlsInit::wait_hello_response``) также не использует эти байты после
-        # HMAC-проверки — response уходит из scope; скармливать unwrapper'у
-        # нельзя, это сломает его буфер.
+        # server_initial_appdata — это AppData-body из FakeTLS handshake
+        # (HMAC-верификация), НЕ obfuscated2 данные. TDLib также не
+        # использует эти байты после проверки; скармливать unwrapper'у
+        # нельзя — это сломает его буфер.
         if server_initial_appdata:
             log.debug(
                 f"[client {client_addr}] Discarded server_initial_appdata: "
@@ -1762,13 +1704,12 @@ async def _handle_client(
 # Корректное (graceful) завершение
 # ============================================================================
 #
-# Идея: не полагаться на штатное поведение asyncio.run() при SIGINT
-# (отмена главной задачи → CancelledError всплывает из serve_forever() →
-# asyncio.run() заново поднимает KeyboardInterrupt — именно так получается
-# трассировка из отчёта). Вместо этого мы сами перехватываем SIGINT/SIGTERM
-# через loop.add_signal_handler, сами останавливаем listener и сами ждём
-# уже открытые соединения — run_bridge() в итоге просто возвращается,
-# без исключений, без трассировки, с exit code 0.
+# Не полагаемся на дефолтное поведение asyncio.run() при SIGINT (отмена
+# главной задачи → CancelledError всплывает из serve_forever() →
+# KeyboardInterrupt с трассировкой). Вместо этого сами перехватываем
+# SIGINT/SIGTERM через loop.add_signal_handler, останавливаем listener и
+# ждём уже открытые соединения — run_bridge() в итоге просто возвращается
+# с exit code 0.
 
 
 def _make_connection_tracker(
@@ -1777,16 +1718,13 @@ def _make_connection_tracker(
     Callable[[asyncio.StreamReader, asyncio.StreamWriter], None],
     set[asyncio.Task],
 ]:
-    """Строит client_connected_cb для asyncio.start_server и множество,
-    в котором будет отслеживаться каждая созданная задача-обработчик.
+    """Строит client_connected_cb для asyncio.start_server + множество
+    активных задач-обработчиков для отслеживания при shutdown.
 
-    Если просто передать асинхронный коллбэк в start_server, сервер сам
-    оборачивает его в Task — но нигде не сохраняет ссылку. Это значит, что
-    отменить конкретное соединение снаружи (например, при shutdown) нечем:
-    задачи просто повиснут до собственного естественного завершения.
-    Здесь мы регистрируем каждую задачу явно и убираем её из множества по
-    завершении (add_done_callback), чтобы _shutdown_server ниже видел
-    актуальный список того, что ещё нужно закрыть.
+    asyncio.start_server оборачивает коллбэк в Task, но не сохраняет ссылку,
+    поэтому отменить конкретное соединение снаружи нельзя. Здесь мы явно
+    регистрируем каждую задачу и убираем её из множества по завершении —
+    чтобы _shutdown_server видел актуальный список того, что ещё нужно закрыть.
     """
     active: set[asyncio.Task] = set()
 
@@ -1808,25 +1746,16 @@ async def _shutdown_server(
 ) -> None:
     """Останавливает listener и корректно закрывает уже открытые соединения.
 
-    server.close() — синхронный вызов: он немедленно снимает listening-сокет
-    с event loop'а (см. Server.close() → loop._stop_serving()), так что
-    новые подключения становятся невозможны ещё до какого-либо await. Его
-    НЕ нужно (и в данном случае нельзя!) дожидаться через wait_closed()
-    прямо здесь: начиная с Python 3.12.1 wait_closed() ждёт закрытия ещё и
-    всех активных соединений сервера — а мы их пока не отменяли. Если
-    вызвать await server.wait_closed() до task.cancel(), получится
-    deadlock: сервер ждёт соединения, а соединения ждут отмены, которая
-    произойдёт только после wait_closed(). Поэтому здесь порядок другой:
-    сначала close() (снимает listener), потом cancel() всех отслеживаемых
-    задач, и только потом ждём их завершения через asyncio.wait — уже
-    закрытые сокеты для wait_closed() дальше не имеют значения, так что
-    отдельно вызывать его не требуется.
+    Порядок важен: сначала ``server.close()`` (снимает listener), потом
+    ``task.cancel()`` для всех отслеживаемых задач, и только потом ждём их
+    через ``asyncio.wait``. ``wait_closed()`` здесь НЕ вызывается — начиная
+    с Python 3.12.1 он ждёт закрытия всех активных соединений сервера, что
+    дало бы deadlock (сервер ждёт соединения, соединения ждут отмены).
 
-    Каждая отменённая задача — это _handle_client(), у которого единый
+    Каждая отменённая задача — это ``_handle_client()`` с единым
     try/except CancelledError/finally на весь пайплайн, так что оба сокета
-    (клиентский и upstream) гарантированно закрываются на любой стадии
-    отмены. grace — верхняя граница ожидания на случай, если какая-то
-    задача всё же зависнет и не среагирует на отмену вовремя.
+    гарантированно закрываются на любой стадии отмены. ``grace`` — верхняя
+    граница ожидания на случай зависшей задачи.
     """
     server.close()
 
@@ -1852,20 +1781,12 @@ def _install_shutdown_handler(stop_event: asyncio.Event) -> None:
     """Регистрирует SIGINT/SIGTERM: по сигналу выставляется stop_event,
     что будит run_bridge() и запускает штатную процедуру остановки.
 
-    Обрабатываем сигнал сами (через loop.add_signal_handler), а не отдаём
-    его дефолтному поведению asyncio.run() — так у нас появляется точка,
-    где можно сперва закрыть listener, затем дождаться уже открытых
-    соединений и только после этого выйти, вместо мгновенного разрыва.
+    Повторный сигнал во время завершения — форсирует немедленный выход через
+    ``os._exit`` (компромисс в пользу отзывчивости Ctrl+C, relay всё равно
+    не буферизует).
 
-    Повторный сигнал во время завершения — сигнал того, что что-то не
-    отвечает на отмену; в этом случае выходим немедленно (os._exit), не
-    дожидаясь ничего, — это осознанный компромисс в пользу отзывчивости
-    Ctrl+C, а не потери данных (relay всё равно не буферизует).
-
-    На Windows add_signal_handler не реализован (NotImplementedError) —
-    откатываемся на classic signal.signal(), которое ловит хотя бы
-    SIGINT/Ctrl+C; SIGTERM на Windows не является настоящим сигналом ОС,
-    поэтому там не обрабатывается ни тем, ни другим способом.
+    На Windows ``add_signal_handler`` не реализован — откатываемся на
+    ``signal.signal()`` (ловит хотя бы SIGINT/Ctrl+C).
     """
     loop = asyncio.get_running_loop()
 
@@ -1966,11 +1887,7 @@ def needs_padded_transport(url: str) -> bool:
 
 
 # Сервер → множество активных задач-обработчиков (см. _make_connection_tracker).
-# Раньше здесь хранилась Task от server.serve_forever(), что позволяло
-# остановить listener (закрытие serve_forever() каскадно вызывает
-# server.close()), но никак не помогало закрыть уже открытые клиентские
-# соединения — они просто оставались висеть. Теперь вместо этого хранится
-# набор именно клиентских задач, и stop_all_bridges может дождаться каждой.
+# Хранятся именно клиентские задачи, чтобы stop_all_bridges могла дождаться каждой.
 _running_servers: dict[asyncio.Server, set[asyncio.Task]] = {}
 
 
@@ -2101,11 +2018,10 @@ def main() -> None:
     try:
         asyncio.run(run_bridge(cfg))
     except KeyboardInterrupt:
-        # Защитная сетка, а не основной механизм: run_bridge() сама ловит
-        # SIGINT через loop.add_signal_handler и завершается без исключений.
-        # Сюда попадаем только если Ctrl+C пришёл до того, как обработчик
-        # успел зарегистрироваться (узкое окно на самом старте), или на
-        # платформе, где add_signal_handler недоступен для part сигналов.
+        # Защитная сетка: run_bridge() сама ловит SIGINT через
+        # loop.add_signal_handler. Сюда попадаем только если Ctrl+C пришёл
+        # до регистрации обработчика (узкое окно на старте) или на
+        # платформе, где add_signal_handler недоступен.
         print("\nInterrupted before startup completed.")
 
 
