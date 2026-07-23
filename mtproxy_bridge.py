@@ -148,11 +148,12 @@ SHUTDOWN_GRACE_SECS = 5.0
 # Разбор tg://proxy?server=...&port=...&secret=... и секрета
 # ============================================================================
 
-# Transport-теги (см. ObfuscatedTransport::init в TDLib).
+# Transport-теги (см. ObfuscatedTransport::init в td/mtproto/TcpTransport.cpp).
 TAG_ABRIDGED = b"\xef\xef\xef\xef"
 TAG_PADDED_INTERMEDIATE = b"\xdd\xdd\xdd\xdd"
 
-# TDLib ProxySecret::MAX_DOMAIN_LENGTH. Домен длиннее обрезается в get_domain().
+# TDLib ProxySecret::MAX_DOMAIN_LENGTH (td/mtproto/ProxySecret.h:18). Домен
+# длиннее обрезается в ProxySecret::get_domain() → substr(0, MAX_DOMAIN_LENGTH).
 _MAX_DOMAIN_LENGTH = 182
 
 
@@ -170,8 +171,9 @@ class ProxyLink(NamedTuple):
 def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
     """Parse an MTProto secret in hex or base64url form.
 
-    Semantics (mirrors TDLib ``ProxySecret::from_binary`` +
-    ``ObfuscatedTransport::init``):
+    Semantics (mirrors TDLib ``ProxySecret::from_binary``,
+    td/mtproto/ProxySecret.cpp:29-46, + ``ObfuscatedTransport::init``
+    из td/mtproto/TcpTransport.cpp):
         - bare 16 bytes            → obfuscated2 + abridged
         - 0xEE + 16 + domain (≥18) → FakeTLS + padded intermediate
         - 0xDD + 16 (len == 17)    → obfuscated2 + padded intermediate
@@ -199,13 +201,16 @@ def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
         return raw, "", False, TAG_ABRIDGED
 
     if raw[0] == 0xEE:
-        # TDLib: ProxySecret::emulate_tls() / from_binary — size ≥ 18.
+        # TDLib: ProxySecret::emulate_tls() → secret.size() ≥ 17 (0xEE + 16 + domain).
+        # ProxySecret::from_binary (td/mtproto/ProxySecret.cpp:39) принимает size ≥ 18
+        # (домен ≥ 1 байт). Мост следует TDLib-семантике.
         if len(raw) < 18:
             raise ValueError(
                 f"FakeTLS (ee) secret must be ≥18 bytes "
                 f"(0xEE + 16-byte key + ≥1-byte domain), got {len(raw)}"
             )
-        # TDLib: get_domain() возвращает secret_.substr(17).
+        # TDLib: ProxySecret::get_domain() возвращает secret_.substr(17)
+        # (td/mtproto/ProxySecret.h:18).
         if len(raw) > 17 + _MAX_DOMAIN_LENGTH:
             raise ValueError(
                 f"FakeTLS domain too long ({len(raw) - 17} bytes), "
@@ -222,7 +227,8 @@ def parse_secret(secret_str: str) -> tuple[bytes, str, bool, bytes]:
         return raw[1:17], domain, True, TAG_PADDED_INTERMEDIATE
 
     if raw[0] == 0xDD:
-        # TDLib: use_random_padding() → secret.size() == 17.
+        # TDLib: ProxySecret::use_random_padding() → secret.size() == 17
+        # (0xDD + 16-byte key).
         if len(raw) != 17:
             raise ValueError(
                 f"dd-secret must be exactly 17 bytes (0xDD + 16-byte key), "
@@ -455,7 +461,8 @@ def _prepare_client_hello_rules(
 
 
 def _prepare_greases() -> bytes:
-    """Генерирует 8 байт GREASE-значений (порт ``Grease::init`` из TDLib)."""
+    """Генерирует 8 байт GREASE-значений (порт ``Grease::init`` из TDLib,
+    td/mtproto/TlsInit.cpp:28-38)."""
     result = bytearray(secrets.token_bytes(_MAX_GREASE))
     for i in range(_MAX_GREASE):
         result[i] = (result[i] & 0xF0) + 0x0A
@@ -466,7 +473,8 @@ def _prepare_greases() -> bytes:
 
 
 class _HelloPart:
-    """Рендерер блоков ClientHello (порт ``TlsHelloStore::do_op`` из TDLib)."""
+    """Рендерер блоков ClientHello (порт ``TlsHelloStore::do_op`` из TDLib,
+    td/mtproto/TlsInit.cpp:386-508)."""
 
     def __init__(self, domain: bytes, greases: bytes):
         self._domain = domain
@@ -577,7 +585,8 @@ class _HelloPart:
             self._error = True
 
     def _render_block_M(self) -> None:
-        """Рендерит Kyber-like блок M (порт ``Op::MlKem768Key`` из TDLib)."""
+        """Рендерит Kyber-like блок M (порт ``Op::MlKem768Key`` из TDLib,
+        td/mtproto/TlsInit.cpp:441-451)."""
         k_elements = 384
         k_added = 32
         output_len = k_elements * 3 + k_added  # 1184
@@ -600,7 +609,7 @@ class _HelloPart:
     def _render_padding(self) -> None:
         """Дополняет ClientHello до 513 байт extension-записью с zero padding.
 
-        Порт ``Op::Padding`` из TDLib.
+        Порт ``Op::Padding`` из TDLib (td/mtproto/TlsInit.cpp:495-504).
         """
         length = len(self._result)
         if length < 513:
@@ -734,8 +743,8 @@ async def async_faketls_handshake(
     """Асинхронный клиентский FakeTLS handshake.
 
     Отправляет ClientHello, читает ServerHello + CCS + AppData, проверяет
-    server-side HMAC-SHA256 (соответствует TDLib ``TlsInit::send_hello`` /
-    ``wait_hello_response``).
+    server-side HMAC-SHA256 (соответствует TDLib ``TlsInit::send_hello`` и
+    ``TlsInit::wait_hello_response``, td/mtproto/TlsInit.cpp:599-648).
 
     Args:
         reader: поток чтения от upstream-прокси.
@@ -898,7 +907,7 @@ async def async_faketls_handshake(
 
 _CLIENT_PREFIX = b"\x14\x03\x03\x00\x01\x01"  # ChangeCipherSpec record
 _CLIENT_HEADER = b"\x17\x03\x03"  # ApplicationData record header
-_MAX_TLS_PACKET_LENGTH = 2878  # TDLib TcpTransport.h:162
+_MAX_TLS_PACKET_LENGTH = 2878  # td/mtproto/TcpTransport.h:162
 
 
 class TLSRecordWriter:
@@ -1059,14 +1068,15 @@ class TLSRecordUnwrapper:
 # obfuscated2 — транспортное шифрование (AES-256-CTR)
 # ============================================================================
 
-# Зарезервированные значения first4 байт init. Соответствует inline-проверке
-# в TDLib ``ObfuscatedTransport::init`` (td/mtproto/TcpTransport.cpp:99-102):
+# Зарезервированные значения first4 байт init (TDLib ``ObfuscatedTransport::init``,
+# td/mtproto/TcpTransport.cpp:99-102):
 #   0x44414548 = "DAEH" (HTTP-ответ, little-endian "HEAD")
 #   0x54534F50 = "TSOP" (little-endian "POST")
 #   0x20544547 = " GET" (little-endian "GET ")
 #   0x4954504f = "ITPO" (little-endian "OPTI" — HTTP OPTIONS)
 #   0x02010316 = первые 4 байта TLS 1.0 ClientHello-фрейма
 #   0xDDDDDDDD / 0xEEEEEEEE = транспортные теги (anti-self-spoofing)
+# Anti-self-spoofing: init packet не должен выглядеть как чужой протокол.
 _RESERVED_FIRST4 = {
     0x44414548,
     0x54534F50,
@@ -1121,7 +1131,8 @@ def build_obfuscated2_header(
         protocol_tag: 4-байтный транспортный тег (``TAG_ABRIDGED`` или
             ``TAG_PADDED_INTERMEDIATE``). Записывается в байты 56..60 init.
         dc: ID дата-центра как signed int16. Положительный для обычных DC,
-            отрицательный для CDN (TDLib: ``DcId::external()`` + ``DcOption::Flags::Cdn``).
+            отрицательный для CDN (TDLib: ``DcId::external()`` +
+            ``DcOption::Flags::Cdn``, кодируется как ``-dc_id`` в int16 protocolDcId).
         secret: 16-байтный секрет прокси (подмешивается в ключи AES через
             SHA-256). ``None`` — без secret-mixing.
 
@@ -1192,7 +1203,8 @@ def detect_client_transport_tag(first_bytes: bytes) -> tuple[bytes, int]:
 
 
 # Built-in Telegram DC IPs. Источник: TDLib ``ConnectionCreator::get_default_dc_options``
-# + актуальный getConfig dcOptions (snapshot 2026-07).
+# (td/telegram/net/ConnectionCreator.cpp:1257-1277) + актуальный getConfig dcOptions
+# (snapshot 2026-07).
 #
 # Мост — SOCKS5-прокси, из которого DC ID не виден напрямую, поэтому делается
 # reverse-mapping target_host → DC по IP-таблице.
@@ -1201,11 +1213,14 @@ def detect_client_transport_tag(first_bytes: bytes) -> tuple[bytes, int]:
 # IPv6 записаны в canonical compressed form (ipaddress.ip_address).
 #
 # ВНИМАНИЕ — расхождение с TDLib по protocolDcId для media_only:
-#   TDLib кодирует media_only DC как ОТРИЦАТЕЛЬНЫЙ; мост кодирует как
-#   ПОЛОЖИТЕЛЬНЫЙ — это намеренное решение, проверенное на практике.
-#   Если строгий TDLib-прокси начнёт отклонять соединения к media_only
-#   endpoints, поменяйте значения 149.154.167.222 / 2001:67c:4e8:f002::b /
-#   149.154.165.120 / 2001:67c:4e8:f004::b на отрицательные (-2 и -4).
+#   TDLib (td/telegram/net/ConnectionCreator.cpp:634) кодирует media_only DC как
+#   `is_media_only() ? -int_dc_id : int_dc_id`, т.е. ОТРИЦАТЕЛЬНЫЙ.
+#   Мост кодирует media_only DC как ПОЛОЖИТЕЛЬНЫЙ (см. значения ниже с
+#   media_only=True) — это намеренное решение, проверенное на практике.
+#   Если прокси, реализованный строго по TDLib-спецификации, начнёт
+#   отклонять соединения к media_only endpoints, поменяйте значения
+#   149.154.167.222 / 2001:67c:4e8:f002::b / 149.154.165.120 /
+#   2001:67c:4e8:f004::b на отрицательные (-2 и -4 соответственно).
 KNOWN_DC_IPS: dict[str, int] = {
     # ===== DC 1 — Miami (auth + API) =====
     "149.154.175.50": 1,  # TDLib bootstrap (legacy)
