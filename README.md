@@ -1,3 +1,5 @@
+### **Readme:** RU | [EN](./README.en.md)
+
 # mtproxy-bridge
 
 [![License](https://img.shields.io/badge/license-LGPL--3.0--or--later-blue.svg)](./COPYING)
