@@ -1,2 +1,117 @@
 # mtproxy-bridge
-MTProxy (MTProto proxy) SOCKS5 bridge for Kurigram and other clients that support padded intermediate and (optional) abridged transport
+
+[![License](https://img.shields.io/badge/license-LGPL--3.0--or--later-blue.svg)](./COPYING)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
+![Status](https://img.shields.io/badge/status-beta-yellow.svg)
+
+> Локальный SOCKS5-мост для Telegram MTProto-прокси (FakeTLS / obfuscated2). Логика хендшейка портирована из C++ **TDLib** — официальной кросс-платформенной библиотеки Telegram, поэтому трафик неотличим от настоящего клиента.
+
+## Зачем это нужно
+
+Ссылки вида `tg://proxy?server=...&port=...&secret=...` (и `https://t.me/proxy?...`) задают Telegram MTProto-прокси — сервер, с которым клиент говорит на протоколе, замаскированном под TLS (FakeTLS) либо обфусцированном (obfuscated2). Kurigram и подобные клиенты такой протокол не понимают, зато умеют работать через обычный SOCKS5.
+
+`mtproxy-bridge` поднимает локальный SOCKS5-сервер, сам проводит хендшейк с прокси и отдаёт клиенту привычный SOCKS5-сокет; дальше байты пробрасываются как есть, без повторного шифрования или разбора MTProto поверх.
+
+## Возможности
+
+- **Автоопределение транспорта** — тип секрета (`dd` / `ee` / голый 16-байтовый) определяется автоматически; нужный клиенту транспорт отдаёт `needs_padded_transport()`.
+- **Точная эмуляция TDLib** — ClientHello (GREASE-значения, блоки M/E, X25519-ключ) собирается по тем же правилам, что и `TlsHello::get_default`.
+- **Автоопределение DC** — по IP или hostname через встроенную таблицу дата-центров (аналог `ConnectionCreator::get_default_dc_options`); есть ручной override.
+- **CLI и библиотека** — разовый запуск из терминала или встраивание в приложение перед созданием Kurigram-клиента.
+- **Устойчивые соединения** — `TCP_NODELAY` + keepalive на upstream, таймаут хендшейка 15 с, таймаут коннекта 5 с, простой закрывает соединение через 30 минут, graceful shutdown по `SIGINT`/`SIGTERM`.
+
+## Установка
+
+Python 3.9+, единственная внешняя зависимость — `cryptography`:
+
+```bash
+pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
+```
+
+## Типы секретов и транспорт
+
+Мост **не переводит фрейминг**: клиент обязан сам использовать транспорт, соответствующий типу секрета.
+
+| Секрет                         | Транспорт клиента                 | Тег          |
+|--------------------------------|------------------------------------|--------------|
+| голый, 16 байт                 | `TCPAbridged`                      | `0xEFEFEFEF` |
+| `0xDD` + 16 байт                | `TCPIntermediatePadded`            | `0xDDDDDDDD` |
+| `0xEE` + 16 байт + домен (SNI)  | FakeTLS → `TCPIntermediatePadded`  | `0xDDDDDDDD` |
+
+Пустой secret (TDLib plain TCP) не поддерживается.
+
+## Использование как библиотека
+
+Основной сценарий — встраивание перед созданием Telegram-клиента. Публичный API:
+
+- `is_mtproto_link(url)` — это `tg://proxy` / `t.me/proxy` или обычный прокси;
+- `needs_padded_transport(url)` — нужен ли клиенту padded-транспорт;
+- `start_local_bridge(tg_link, ...)` — поднимает мост фоном, возвращает локальный порт;
+- `stop_all_bridges()` — останавливает все мосты.
+
+Пример с Kurigram (`log`, `API_ID`, `API_HASH` — ваши):
+
+```python
+from pyrogram import Client
+from pyrogram.connection.transport import TCPAbridged, TCPIntermediatePadded
+from mtproxy_bridge import is_mtproto_link, needs_padded_transport, start_local_bridge
+
+async def create_client(proxy_url: str | None) -> Client | None:
+    kwargs = {"api_id": API_ID, "api_hash": API_HASH}
+    if proxy_url and is_mtproto_link(proxy_url):
+        try:
+            port = await start_local_bridge(proxy_url)
+            kwargs["proxy"] = {"scheme": "socks5", "hostname": "127.0.0.1", "port": port}
+            kwargs["protocol_factory"] = (
+                TCPIntermediatePadded if needs_padded_transport(proxy_url) else TCPAbridged
+            )
+        except Exception as e:
+            log.critical(f"Не удалось поднять мост: {e}")
+            return None
+    return Client("session", **kwargs)
+```
+
+Невалидная ссылка или secret — `ValueError`; вызов стоит оборачивать в `try/except`, как в примере. Чтобы погасить мосты (например, в своём обработчике `SIGINT`/`SIGTERM`), вызовите `stop_all_bridges()`.
+
+## Использование через CLI
+
+Не основной способ — библиотека рассчитана на встраивание (см. выше). Пример:
+
+```bash
+mtproxy-bridge "tg://proxy?server=1.2.3.4&port=443&secret=ee0102..." --listen-port 8088
+```
+
+Вывод при старте:
+
+```
+SOCKS5 bridge listening on
+
+socks5://127.0.0.1:8088
+
+tunnel to 1.2.3.4:443 (FakeTLS)
+transport=padded intermediate (0xDD), send_ccs=True, use_block_m=True, use_block_e=True
+```
+
+| Параметр            | По умолчанию              | Описание |
+|---------------------|----------------------------|----------|
+| `tg_link`           | — (обязателен)             | `tg://proxy?server=...&port=...&secret=...` |
+| `--listen-host`     | `127.0.0.1`                 | Хост локального SOCKS5-сервера |
+| `--listen-port`     | `1080`                      | Порт локального SOCKS5-сервера |
+| `--dc-id-override`  | автоопределение             | Явно задать DC ID, если автоопределение не сработало |
+| `--no-ccs`          | выкл. (CCS отправляется)    | Не слать CCS (TDLib `first_prefix`) перед первым AppData-рекордом |
+| `--no-block-m`      | выкл. (блок включён)        | Отключить блок M (Kyber-like) в ClientHello |
+| `--no-block-e`      | выкл. (блок включён)        | Отключить блок E в ClientHello |
+| `--debug`           | выкл.                       | DEBUG-логирование |
+
+## Ограничения
+
+- SOCKS5-сервер моста поддерживает только no-auth и команду `CONNECT` — этого достаточно для локального использования, но не делает его многопользовательским прокси.
+- DC ID ищется по встроенной таблице известных IP/доменов; если хост не резолвится или отсутствует в таблице, нужен `--dc-id-override`.
+
+## Лицензия
+
+LGPL-3.0-or-later — см. [`COPYING`](./COPYING), [`COPYING.LESSER`](./COPYING.LESSER), [`NOTICE`](./NOTICE).
+
+## Благодарности
+
+Хендшейк портирован с исходников [TDLib](https://github.com/tdlib/td) — в частности `ObfuscatedTransport::init`, `ProxySecret`, `TlsInit::send_hello` и таблица дата-центров из `ConnectionCreator::get_default_dc_options`. Проект не аффилирован с Telegram.
