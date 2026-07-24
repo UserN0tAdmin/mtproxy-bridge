@@ -8,7 +8,9 @@
 
 ## Зачем это нужно
 
-Ссылки вида `tg://proxy?server=...&port=...&secret=...` (и `https://t.me/proxy?...`) задают Telegram MTProto-прокси — сервер, с которым клиент говорит на протоколе, замаскированном под TLS (FakeTLS) либо обфусцированном (obfuscated2). Kurigram и подобные клиенты такой протокол не понимают, зато умеют работать через обычный SOCKS5.
+Ссылки вида `tg://proxy?server=...&port=...&secret=...` (и `https://t.me/proxy?...`) задают Telegram MTProto-прокси — сервер, с которым клиент говорит на протоколе, замаскированном под TLS (FakeTLS) либо обфусцированном (obfuscated2). 
+
+Kurigram и подобные клиенты такой протокол не понимают, зато умеют работать через обычный SOCKS5.
 
 `mtproxy-bridge` поднимает локальный SOCKS5-сервер, сам проводит хендшейк с прокси и отдаёт клиенту привычный SOCKS5-сокет; дальше байты пробрасываются как есть, без повторного шифрования или разбора MTProto поверх.
 
@@ -44,8 +46,8 @@ pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
 
 Основной сценарий — встраивание перед созданием Telegram-клиента. Публичный API:
 
-- `is_mtproto_link(url)` — это `tg://proxy` / `t.me/proxy` или обычный прокси;
-- `needs_padded_transport(url)` — нужен ли клиенту padded-транспорт;
+- `is_mtproto_link(url)` — проверяет это `tg://proxy` / `t.me/proxy` или обычный прокси;
+- `needs_padded_transport(url)` — проверяет нужен ли клиенту padded-транспорт;
 - `start_local_bridge(tg_link, ...)` — поднимает мост фоном, возвращает локальный порт;
 - `stop_all_bridges()` — останавливает все мосты.
 
@@ -75,7 +77,7 @@ async def create_client(proxy_url: str | None) -> Client | None:
 
 ## Использование через CLI
 
-Не основной способ — библиотека рассчитана на встраивание (см. выше). Пример:
+Не основной способ использования. Пример:
 
 ```bash
 mtproxy-bridge "tg://proxy?server=1.2.3.4&port=443&secret=ee0102..." --listen-port 8088
@@ -103,6 +105,8 @@ transport=padded intermediate (0xDD), send_ccs=True, use_block_m=True, use_block
 | `--no-block-e`      | выкл. (блок включён)        | Отключить блок E в ClientHello |
 | `--debug`           | выкл.                       | DEBUG-логирование |
 
+### Настоятельно рекомендуется не выключать CCS, блок E или M без явной необходимости!
+
 ## Ограничения
 
 - SOCKS5-сервер моста поддерживает только no-auth и команду `CONNECT` — этого достаточно для локального использования, но не делает его многопользовательским прокси.
@@ -114,4 +118,4 @@ LGPL-3.0-or-later — см. [`COPYING`](./COPYING), [`COPYING.LESSER`](./COPYING
 
 ## Благодарности
 
-Хендшейк портирован с исходников [TDLib](https://github.com/tdlib/td) — в частности `ObfuscatedTransport::init`, `ProxySecret`, `TlsInit::send_hello` и таблица дата-центров из `ConnectionCreator::get_default_dc_options`. Проект не аффилирован с Telegram.
+Хендшейк портирован с исходников [TDLib](https://github.com/tdlib/td) — в частности `ObfuscatedTransport`, `ProxySecret`, `TlsInit` и `ConnectionCreator::get_default_dc_options`. Проект не аффилирован с Telegram.
