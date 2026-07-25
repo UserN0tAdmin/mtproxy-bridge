@@ -26,6 +26,8 @@ Kurigram и подобные клиенты такой протокол не п�
 
 ## Установка
 
+**_На текущий момент работает лишь с dev версией Kurigram, ибо TCPIntermediatePadded пока только там. Также возможно с иными клиентами, кто поддерживает [TCPIntermediatePadded](core.telegram.org/mtproto/mtproto-transports#padded-intermediate)._**
+
 Python 3.9+, единственная внешняя зависимость — `cryptography`:
 
 ```bash
@@ -117,6 +119,10 @@ socks5://127.0.0.1:8088
 tunnel to 1.2.3.4:443 (FakeTLS)
 transport=padded intermediate (0xDD), send_ccs=True, use_block_m=True, use_block_e=True
 ```
+
+### В клиенте должен быть выбран соотв. транспорт!
+
+___
 
 | Параметр            | По умолчанию              | Описание |
 |---------------------|----------------------------|----------|
