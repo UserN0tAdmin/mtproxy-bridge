@@ -34,6 +34,8 @@ Python 3.9+, the only external dependency is `cryptography`:
 pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
 ```
 
+For update `--force-reinstall`
+
 ## Secret types and transport
 
 The bridge **does not translate framing**: the client itself must use the transport that matches the secret type.
@@ -82,7 +84,7 @@ async def create_client(proxy_url: str | None) -> Client | None:
             kwargs["proxy"] = {"scheme": "socks5", "hostname": "127.0.0.1", "port": port}
             kwargs["protocol_factory"] = transport
         except Exception as e:
-            print(f"Не удалось поднять мост: {e}")
+            print(f"The bridge could not be raised: {e}")
             return None
     return Client("my_account", **kwargs)
 
