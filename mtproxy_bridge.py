@@ -28,7 +28,7 @@ Transport framing is determined by the secret type (mirrors TDLib
 
    - 0xEE + 16 bytes + domain → FakeTLS + padded        (0xDDDDDDDD)
    - 0xDD + 16 bytes          → obfuscated2 + padded    (0xDDDDDDDD)
-   - bare 16 bytes            → obfuscated2 + abridged  (0xEFEFEFEF)
+   - bare 16 bytes            → obfuscated2 + abridged  (0xEF)
 
 The bridge does NOT translate framing: the client must use the transport
 matching the secret (``TCPIntermediatePadded`` for ee/dd, ``TCPAbridged`` for

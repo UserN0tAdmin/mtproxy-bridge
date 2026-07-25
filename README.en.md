@@ -38,9 +38,9 @@ pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
 
 The bridge **does not translate framing**: the client itself must use the transport that matches the secret type.
 
-| Secret                            | Client transport                    | Tag          |
-|------------------------------------|---------------------------------------|--------------|
-| bare, 16 bytes                     | `TCPAbridged`                         | `0xEFEFEFEF` |
+| Secret                            | Client transport                    | Tag    |
+|------------------------------------|---------------------------------------|--------|
+| bare, 16 bytes                     | `TCPAbridged`                         | `0xEF` |
 | `0xDD` + 16 bytes                   | `TCPIntermediatePadded`               | `0xDDDDDDDD` |
 | `0xEE` + 16 bytes + domain (SNI)    | FakeTLS → `TCPIntermediatePadded`     | `0xDDDDDDDD` |
 
