@@ -53,26 +53,48 @@ The primary scenario is embedding it before creating the Telegram client. Public
 - `start_local_bridge(tg_link, ...)` — starts the bridge in the background, returns the local port;
 - `stop_all_bridges()` — stops all bridges.
 
-Example with Kurigram (`log`, `API_ID`, `API_HASH` are yours):
+Example userbot with Kurigram:
 
 ```python
+import asyncio
+from typing import Any
+
 from pyrogram import Client
 from pyrogram.connection.transport import TCPAbridged, TCPIntermediatePadded
 from mtproxy_bridge import is_mtproto_link, needs_padded_transport, start_local_bridge
 
+# PASTE YOURS
+API_ID = 1234567
+API_HASH = "123456789abcdefgh"
+MTPROXY = "https://t.me/proxy?server=...&port=...&secret=..."
+
 async def create_client(proxy_url: str | None) -> Client | None:
-    kwargs = {"api_id": API_ID, "api_hash": API_HASH}
+    kwargs: dict[str, Any] = {
+        "api_id": API_ID,
+        "api_hash": API_HASH,
+    }
     if proxy_url and is_mtproto_link(proxy_url):
         try:
             port = await start_local_bridge(proxy_url)
+            transport = TCPIntermediatePadded if needs_padded_transport(proxy_url) else TCPAbridged
             kwargs["proxy"] = {"scheme": "socks5", "hostname": "127.0.0.1", "port": port}
-            kwargs["protocol_factory"] = (
-                TCPIntermediatePadded if needs_padded_transport(proxy_url) else TCPAbridged
-            )
+            kwargs["protocol_factory"] = transport
         except Exception as e:
-            log.critical(f"Failed to start the bridge: {e}")
+            print(f"Не удалось поднять мост: {e}")
             return None
-    return Client("session", **kwargs)
+    return Client("my_account", **kwargs)
+
+async def main() -> None:
+    app = await create_client(MTPROXY)
+    if app is None:
+        return
+    async with app:
+        chat = await app.get_chat("https://t.me/durov")
+        print(chat)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
 ```
 
 An invalid link or secret raises `ValueError`; wrap the call in `try/except`, as in the example above. To shut down the bridges (e.g., from your own `SIGINT`/`SIGTERM` handler), call `stop_all_bridges()`.

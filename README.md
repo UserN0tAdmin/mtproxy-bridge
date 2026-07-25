@@ -53,26 +53,48 @@ pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
 - `start_local_bridge(tg_link, ...)` — поднимает мост фоном, возвращает локальный порт;
 - `stop_all_bridges()` — останавливает все мосты.
 
-Пример с Kurigram (`log`, `API_ID`, `API_HASH` — ваши):
+Пример юзербота с Kurigram:
 
 ```python
+import asyncio
+from typing import Any
+
 from pyrogram import Client
 from pyrogram.connection.transport import TCPAbridged, TCPIntermediatePadded
 from mtproxy_bridge import is_mtproto_link, needs_padded_transport, start_local_bridge
 
+# ВСТАВЬТЕ СВОИ
+API_ID = 1234567
+API_HASH = "123456789abcdefgh"
+MTPROXY = "https://t.me/proxy?server=...&port=...&secret=..."
+
 async def create_client(proxy_url: str | None) -> Client | None:
-    kwargs = {"api_id": API_ID, "api_hash": API_HASH}
+    kwargs: dict[str, Any] = {
+        "api_id": API_ID,
+        "api_hash": API_HASH,
+    }
     if proxy_url and is_mtproto_link(proxy_url):
         try:
             port = await start_local_bridge(proxy_url)
+            transport = TCPIntermediatePadded if needs_padded_transport(proxy_url) else TCPAbridged
             kwargs["proxy"] = {"scheme": "socks5", "hostname": "127.0.0.1", "port": port}
-            kwargs["protocol_factory"] = (
-                TCPIntermediatePadded if needs_padded_transport(proxy_url) else TCPAbridged
-            )
+            kwargs["protocol_factory"] = transport
         except Exception as e:
-            log.critical(f"Не удалось поднять мост: {e}")
+            print(f"Не удалось поднять мост: {e}")
             return None
-    return Client("session", **kwargs)
+    return Client("my_account", **kwargs)
+
+async def main() -> None:
+    app = await create_client(MTPROXY)
+    if app is None:
+        return
+    async with app:
+        chat = await app.get_chat("https://t.me/durov")
+        print(chat)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
 ```
 
 Невалидная ссылка или secret — `ValueError`; вызов стоит оборачивать в `try/except`, как в примере. Чтобы погасить мосты (например, в своём обработчике `SIGINT`/`SIGTERM`), вызовите `stop_all_bridges()`.
