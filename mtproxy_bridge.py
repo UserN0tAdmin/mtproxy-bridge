@@ -85,8 +85,8 @@ def _hex(data: bytes, limit: int = 64) -> str:
 # TCP-тюнинг upstream-сокета (TCP_NODELAY + keepalive)
 # ============================================================================
 
-_TCP_KEEPALIVE_TIME = 30  # секунд до первого keepalive-проба
-_TCP_KEEPALIVE_INTERVAL = 10  # секунд между пробами
+_TCP_KEEPALIVE_TIME = 10  # секунд до первого keepalive-проба
+_TCP_KEEPALIVE_INTERVAL = 5  # секунд между пробами
 _TCP_KEEPALIVE_PROBES = 3  # проб до разрыва
 
 
