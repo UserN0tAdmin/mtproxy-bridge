@@ -26,7 +26,9 @@ Kurigram и подобные клиенты такой протокол не п�
 
 ## Установка
 
-**_На текущий момент работает лишь с dev версией Kurigram, ибо TCPIntermediatePadded пока только там. Также возможно с иными клиентами, кто поддерживает [TCPIntermediatePadded](https://core.telegram.org/mtproto/mtproto-transports#padded-intermediate)._**
+Kurigram v2.2.25+
+
+Также возможно с иными клиентами, кто поддерживает [TCP Padded Intermediate](https://core.telegram.org/mtproto/mtproto-transports#padded-intermediate)
 
 Python 3.9+, единственная внешняя зависимость — `cryptography`:
 
