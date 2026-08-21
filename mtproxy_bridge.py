@@ -1203,7 +1203,7 @@ def detect_client_transport_tag(first_bytes: bytes) -> tuple[bytes, int]:
 
 # Built-in Telegram DC IPs. Источник: TDLib ``ConnectionCreator::get_default_dc_options``
 # (td/telegram/net/ConnectionCreator.cpp:1257-1277) + актуальный getConfig dcOptions
-# (snapshot 2026-07).
+# (snapshot 2026-08).
 #
 # Мост — SOCKS5-прокси, из которого DC ID не виден напрямую, поэтому делается
 # reverse-mapping target_host → DC по IP-таблице.
@@ -1223,28 +1223,39 @@ def detect_client_transport_tag(first_bytes: bytes) -> tuple[bytes, int]:
 KNOWN_DC_IPS: dict[str, int] = {
     # ===== DC 1 — Miami (auth + API) =====
     "149.154.175.50": 1,  # TDLib bootstrap (legacy)
-    "149.154.175.57": 1,  # getConfig: текущий primary
-    "149.154.175.53": 1,  # getConfig: static=True
+    "149.154.175.57": 1,  # getConfig: текущий primary (старый)
+    "149.154.175.53": 1,  # getConfig: static=True (старый)
+    "149.154.175.55": 1,  # getConfig: primary + static=True (новый)
     "2001:b28:f23d:f001::a": 1,  # IPv6 primary
+
     # ===== DC 2 — Amsterdam (auth + API + media) =====
     "149.154.167.51": 2,  # TDLib bootstrap (legacy)
     "95.161.76.100": 2,  # TDLib bootstrap (legacy)
     "149.154.167.41": 2,  # getConfig: primary, static=True
-    "149.154.167.222": 2,  # getConfig: media_only=True
+    "149.154.167.50": 2,  # getConfig (новый)
+    "149.154.167.222": 2,  # getConfig: media_only=True (старый)
+    "149.154.167.151": 2,  # getConfig: media_only=True (новый)
     "2001:67c:4e8:f002::a": 2,  # IPv6 primary
     "2001:67c:4e8:f002::b": 2,  # IPv6 media_only=True
+
     # ===== DC 3 — Miami (auth + API) =====
     "149.154.175.100": 3,  # getConfig: primary, static=True
     "2001:b28:f23d:f003::a": 3,  # IPv6 primary
+
     # ===== DC 4 — Amsterdam (auth + API + media) =====
-    "149.154.167.91": 4,  # getConfig: primary, static=True
-    "149.154.165.120": 4,  # getConfig: media_only=True
+    "149.154.167.91": 4,  # getConfig: primary, static=True (старый)
+    "149.154.167.92": 4,  # getConfig: primary + static=True (новый)
+    "149.154.165.120": 4,  # getConfig: media_only=True (старый)
+    "149.154.167.43": 4,  # getConfig: media_only=True (новый)
     "2001:67c:4e8:f004::a": 4,  # IPv6 primary
     "2001:67c:4e8:f004::b": 4,  # IPv6 media_only=True
+
     # ===== DC 5 — Singapore (auth + API) =====
     "149.154.171.5": 5,  # TDLib bootstrap (legacy)
-    "91.108.56.101": 5,  # getConfig: primary, static=True
+    "91.108.56.101": 5,  # getConfig: primary, static=True (старый)
+    "91.108.56.168": 5,  # getConfig: primary + static=True (новый)
     "2001:b28:f23f:f005::a": 5,  # IPv6 primary
+
     # ===== Test DCs (TDLib test-mode bootstrap) — dc ID = 10000 + id =====
     "149.154.175.10": 10001,
     "149.154.167.40": 10002,
@@ -1254,6 +1265,7 @@ KNOWN_DC_IPS: dict[str, int] = {
     "2001:67c:4e8:f002::e": 10002,
     "2001:b28:f23d:f003::e": 10003,
 }
+
 
 # CDN DCs (help.getConfig dcOptions с cdn=True). protocolDcId кодируется как
 # отрицательный int16 (TDLib: DcId::external() → protocolDcId = -dc_id).
