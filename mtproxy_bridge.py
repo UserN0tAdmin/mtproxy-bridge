@@ -1345,12 +1345,12 @@ async def guess_dc_id_async(target_host: str) -> int:
         raise ValueError(
             f"Could not determine DC ID for {target_host}: "
             f"DNS-resolve failed ({dns_error}). "
-            f"Use --dc-id-override."
+            f"Use --dc-id-override or dc_id_override= in start_local_bridge()."
         ) from dns_error
     raise ValueError(
         f"Could not determine DC ID for {target_host}: "
         f"IP not found in the built-in DC table (TDLib ConnectionCreator + getConfig). "
-        f"If the target is a non-standard DC, use --dc-id-override."
+        f"If the target is a non-standard DC, use --dc-id-override or dc_id_override= in start_local_bridge()."
     )
 
 
