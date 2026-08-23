@@ -6,19 +6,22 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
 ![Status](https://img.shields.io/badge/status-beta-yellow.svg)
 
-> A local SOCKS5 bridge for Telegram MTProto proxies (FakeTLS / obfuscated2). The handshake logic is ported from the C++ **TDLib** — Telegram's official cross-platform library — so the traffic is indistinguishable from a genuine client.
+> A local SOCKS5 bridge for Telegram MTProto proxies (FakeTLS / obfuscated2) and the new **WEB Proxy** type (`tg://webproxy`). The handshake logic is ported from the C++ **TDLib** — Telegram's official cross-platform library — so the traffic is indistinguishable from a genuine client.
 
 ## Why this is needed
 
 Links of the form `tg://proxy?server=...&port=...&secret=...` (and `https://t.me/proxy?...`) define a Telegram MTProto proxy — a server the client talks to using a protocol disguised as TLS (FakeTLS) or obfuscated (obfuscated2).
 
-Kurigram and similar clients don't understand this protocol, but they do know how to work through a plain SOCKS5.
+The new `tg://webproxy?server=...&secret=...` type (WEB Proxy) has no dedicated TCP port: MTProto traffic is multiplexed through an HTTPS/WebSocket carrier session to a WEB relay.
 
-`mtproxy-bridge` starts a local SOCKS5 server, performs the handshake with the proxy itself, and hands the client a familiar SOCKS5 socket; from then on, bytes are relayed as-is, with no re-encryption or MTProto parsing on top.
+Kurigram and similar clients understand neither protocol, but they do know how to work through a plain SOCKS5.
+
+`mtproxy-bridge` starts a local SOCKS5 server, performs the handshake with the proxy itself (or keeps a WEB session with the relay), and hands the client a familiar SOCKS5 socket; from then on, bytes are relayed as-is, with no re-encryption or MTProto parsing on top.
 
 ## Features
 
 - **Automatic transport detection** — the secret type (`dd` / `ee` / bare 16-byte) is detected automatically; `needs_padded_transport()` reports which transport the client needs.
+- **WEB Proxy support** — `tg://webproxy` / `t.me/webproxy` links: bridge capability derived via HMAC(secret, host), bootstrap through the relay's page, all 4 carrier modes (`https`, `https-lanes`, `websocket`, `websocket-lanes`), 4 MiB flow-control windows.
 - **Accurate TDLib emulation** — the ClientHello (GREASE values, M/E blocks, X25519 key) is built following the same rules as `TlsHello::get_default`.
 - **Automatic DC detection** — by IP or hostname, via a built-in data-center table (analogous to `ConnectionCreator::get_default_dc_options`); manual override available.
 - **CLI and library** — one-off runs from the terminal, or embed it in an application before creating the Kurigram client.
@@ -30,7 +33,7 @@ Kurigram v2.2.25+
 
 It may also work with other clients that support [TCP Padded Intermediate](https://core.telegram.org/mtproto/mtproto-transports#padded-intermediate)
 
-Python 3.9+, the only external dependency is `cryptography`:
+Python 3.9+, external dependencies are `cryptography` and `aiohttp`:
 
 ```bash
 pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
@@ -50,13 +53,16 @@ The bridge **does not translate framing**: the client itself must use the transp
 
 An empty secret (TDLib plain TCP) is not supported.
 
+WEB Proxy (`tg://webproxy`) supports only `plain` (16 bytes) and `dd` secrets; `ee`/FakeTLS does not exist in WEB mode.
+
 ## Using it as a library
 
 The primary scenario is embedding it before creating the Telegram client. Public API:
 
-- `is_mtproto_link(url)` — checks whether this is a `tg://proxy` / `t.me/proxy` link or a regular proxy;
+- `is_mtproto_link(url)` — checks whether this is a `tg://proxy` / `t.me/proxy` / `tg://webproxy` link or a regular proxy;
+- `is_web_proxy_link(url)` — checks WEB links separately;
 - `needs_padded_transport(url)` — checks whether the client needs padded transport;
-- `start_local_bridge(tg_link, ...)` — starts the bridge in the background, returns the local port;
+- `start_local_bridge(tg_link, ...)` — starts the bridge in the background, returns the local port (the link type is detected automatically);
 - `stop_all_bridges()` — stops all bridges.
 
 Example userbot with Kurigram:
@@ -104,6 +110,18 @@ if __name__ == "__main__":
 ```
 
 An invalid link or secret raises `ValueError`; wrap the call in `try/except`, as in the example above. To shut down the bridges (e.g., from your own `SIGINT`/`SIGTERM` handler), call `stop_all_bridges()`.
+
+### WEB Proxy
+
+The example works unchanged if you put a WEB link into `MTPROXY`:
+
+```python
+MTPROXY = "tg://webproxy?server=proxy.example.com&secret=dd0123456789abcdef0123456789abcdef"
+```
+
+The bridge derives the bridge-capability (HMAC-SHA256 over hostname+secret), fetches the bootstrap from the relay's page, creates a session and uses whatever carrier mode the server announces (`https`, `https-lanes`, `websocket`, `websocket-lanes`). If a carrier dies, it is re-established lazily on the next client connection.
+
+For non-standard deployments and tests, `start_local_bridge` accepts `web_origin=` to override the default `https://<host>` origin.
 
 ## Using it via the CLI
 

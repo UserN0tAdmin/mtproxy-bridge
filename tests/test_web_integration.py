@@ -18,11 +18,13 @@ tproxy-server к официальному MTProxy.
 
 import asyncio
 import base64
+import hashlib
 import os
 from collections import deque
 
 import pytest
 from aiohttp import web
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from mtproxy_bridge.links import parse_web_link
 from mtproxy_bridge.web import frames as f
@@ -49,10 +51,17 @@ class _Session:
 
 
 class MockRelay:
-    """Минимальный релей: bridge page + session/up/down, бэкенд-эхо."""
+    """Минимальный релей: bridge page + session/up/down, бэкенд-эхо.
 
-    def __init__(self, backend_port: int) -> None:
+    Если задан ``mtproto_secret`` (16 байт), бэкенд говорит по-настоящему
+    obfuscated2 (как официальный MTProxy): читает init клиента, выводит
+    серверные ключи и отвечает собственным init'ом — иначе это тупое эхо,
+    пригодное только для тестов без MTProto-трансформа.
+    """
+
+    def __init__(self, backend_port: int, mtproto_secret: bytes | None = None) -> None:
         self.backend_port = backend_port
+        self.mtproto_secret = mtproto_secret
         self.port: int | None = None
         self.capability: str | None = None
         self.bootstrap_token = _random_token()
@@ -122,9 +131,13 @@ class MockRelay:
                     "127.0.0.1", self.backend_port
                 )
                 session.writers[stream_id] = writer
-                task = asyncio.create_task(
-                    self._pipe(session, stream_id, reader, writer)
-                )
+                if self.mtproto_secret is not None:
+                    coro = self._pipe_obf(
+                        session, stream_id, reader, writer, self.mtproto_secret
+                    )
+                else:
+                    coro = self._pipe(session, stream_id, reader, writer)
+                task = asyncio.create_task(coro)
                 session.backend_tasks.add(task)
                 task.add_done_callback(session.backend_tasks.discard)
             elif frame.type is f.FrameType.DATA:
@@ -175,6 +188,60 @@ class MockRelay:
         if request.headers.get("Authorization") != f"Bearer {self.session_token}":
             return web.Response(status=404)
         return web.Response(status=204)
+
+    @staticmethod
+    def _ctr(key: bytes, iv: bytes):
+        cipher = Cipher(algorithms.AES(key), modes.CTR(iv))
+        return cipher.encryptor(), cipher.decryptor()
+
+    async def _pipe_obf(
+        self,
+        session: _Session,
+        stream_id: int,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        secret: bytes,
+    ) -> None:
+        """Бэкенд с server-side obfuscated2 (порт поведения MTProxy).
+
+        В obfuscated2 обмен handshake односторонний: клиент шлёт 64-байтный
+        init, а ВСЕ серверные ключи выводятся из него же — прямой порядок
+        (init[8:56] + SHA-256 с секретом) для расшифровки входящего и
+        развёрнутый init[8:56][::-1] для шифрования исходящего. Второй init
+        сервер не отправляет: мост расшифровывает ответ своим decryptor,
+        выведенным ровно из этих развёрнутых байт.
+        """
+        try:
+            init = await reader.readexactly(64)
+            dec_key = hashlib.sha256(init[8:40] + secret).digest()
+            dec_iv = init[40:56]
+            _, srv_decryptor = self._ctr(dec_key, dec_iv)
+            # Синхронизация счётчика keystream: клиентский шифратор уже
+            # «прогнал» через себя весь 64-байтный init (шифруя хвост),
+            # поэтому сервер обязан прогнать handshake через расшифровщик,
+            # прежде чем читать фреймы — иначе сдвиг на 64 байта.
+            srv_decryptor.update(init)
+
+            rev = bytes(init[8:56])[::-1]
+            enc_key = hashlib.sha256(rev[:32] + secret).digest()
+            srv_encryptor, _ = self._ctr(enc_key, rev[32:48])
+
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                plain = srv_decryptor.update(data)
+                await session.down_queue.put(
+                    f.encode(
+                        f.FrameType.DATA,
+                        stream_id,
+                        srv_encryptor.update(plain),
+                    )
+                )
+        finally:
+            session.writers.pop(stream_id, None)
+            writer.close()
+            await session.down_queue.put(f.encode(f.FrameType.CLOSE, stream_id))
 
     async def _pipe(
         self,

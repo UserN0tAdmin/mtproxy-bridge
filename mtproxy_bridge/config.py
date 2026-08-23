@@ -20,11 +20,23 @@
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from .links import WebProxyLink
 
 
 class BridgeConfig(NamedTuple):
-    """Конфигурация моста: listen + upstream + опции FakeTLS/obfuscated2."""
+    """Конфигурация моста: listen + upstream + опции FakeTLS/obfuscated2.
+
+    Два режима туннеля:
+
+    - direct (по умолчанию): TCP до ``upstream_host:upstream_port``,
+      при ee-секрете — FakeTLS;
+    - WEB (``web_link`` не None): мультиплексированная сессия через
+      WEB-релей (см. :mod:`mtproxy_bridge.web`); поля upstream/FakeTLS
+      не используются, ``expected_tag`` выводится из типа секрета.
+    """
 
     listen_host: str
     listen_port: int
@@ -38,6 +50,11 @@ class BridgeConfig(NamedTuple):
     send_ccs: bool = True
     use_block_m: bool = True
     use_block_e: bool = True
+    # --- WEB-режим (tg://webproxy) ---
+    web_link: WebProxyLink | None = None
+    # Override origin для WebTunnel (http://127.0.0.1:port в тестах);
+    # None → https://<host> из ссылки.
+    web_origin: str | None = None
 
 
 # ============================================================================

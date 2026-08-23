@@ -25,14 +25,20 @@ import asyncio
 import logging
 
 from .config import BridgeConfig
-from .links import parse_tg_link
+from .links import parse_tg_link, parse_web_link
+from .obfuscated2 import TAG_ABRIDGED, TAG_PADDED_INTERMEDIATE
 from .server import run_bridge
+from .web.tunnel import WebTunnel
 
 
 def main() -> None:
     """CLI entry point: parse arguments and start a blocking bridge."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("tg_link", help="tg://proxy?server=...&port=...&secret=...")
+    parser.add_argument(
+        "tg_link",
+        help="tg://proxy?server=...&port=...&secret=... or "
+        "tg://webproxy?server=...&secret=...",
+    )
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=1080)
     parser.add_argument("--dc-id-override", type=int, default=0)
@@ -41,19 +47,20 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Do not send CCS (TDLib first_prefix) before the first AppData record "
-        "(sent by default, like TDLib ObfuscatedTransport::do_write_tls)",
+        "(direct FakeTLS mode only; sent by default, like TDLib "
+        "ObfuscatedTransport::do_write_tls)",
     )
     parser.add_argument(
         "--no-block-m",
         action="store_true",
         default=False,
-        help="Disable block M (Kyber-like) in ClientHello",
+        help="Disable block M (Kyber-like) in ClientHello (direct mode only)",
     )
     parser.add_argument(
         "--no-block-e",
         action="store_true",
         default=False,
-        help="Disable block E in ClientHello",
+        help="Disable block E in ClientHello (direct mode only)",
     )
     parser.add_argument(
         "--debug", action="store_true", default=False, help="Enable DEBUG logging"
@@ -65,23 +72,45 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    link = parse_tg_link(args.tg_link)
-    cfg = BridgeConfig(
-        listen_host=args.listen_host,
-        listen_port=args.listen_port,
-        upstream_host=link.server,
-        upstream_port=link.port,
-        secret_key=link.secret_key,
-        domain=link.domain,
-        is_fake_tls=link.is_fake_tls,
-        expected_tag=link.expected_tag,
-        dc_id_override=args.dc_id_override,
-        send_ccs=not args.no_ccs,
-        use_block_m=not args.no_block_m,
-        use_block_e=not args.no_block_e,
-    )
+    tunnel: WebTunnel | None = None
+    if args.tg_link.strip().lower().startswith(("tg://webproxy", "https://t.me/webproxy")):
+        web_link = parse_web_link(args.tg_link)
+        cfg = BridgeConfig(
+            listen_host=args.listen_host,
+            listen_port=args.listen_port,
+            upstream_host="",
+            upstream_port=0,
+            secret_key=web_link.secret_key,
+            domain="",
+            is_fake_tls=False,
+            expected_tag=(
+                TAG_PADDED_INTERMEDIATE if web_link.is_padded else TAG_ABRIDGED
+            ),
+            dc_id_override=args.dc_id_override,
+            send_ccs=True,
+            use_block_m=True,
+            use_block_e=True,
+            web_link=web_link,
+        )
+        tunnel = WebTunnel(web_link)
+    else:
+        link = parse_tg_link(args.tg_link)
+        cfg = BridgeConfig(
+            listen_host=args.listen_host,
+            listen_port=args.listen_port,
+            upstream_host=link.server,
+            upstream_port=link.port,
+            secret_key=link.secret_key,
+            domain=link.domain,
+            is_fake_tls=link.is_fake_tls,
+            expected_tag=link.expected_tag,
+            dc_id_override=args.dc_id_override,
+            send_ccs=not args.no_ccs,
+            use_block_m=not args.no_block_m,
+            use_block_e=not args.no_block_e,
+        )
     try:
-        asyncio.run(run_bridge(cfg))
+        asyncio.run(run_bridge(cfg, web_tunnel=tunnel))
     except KeyboardInterrupt:
         # Защитная сетка: run_bridge() сама ловит SIGINT через
         # loop.add_signal_handler. Сюда попадаем только если Ctrl+C пришёл

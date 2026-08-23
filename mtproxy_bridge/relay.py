@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 from .config import (
     ACTIVITY_TIMEOUT_SECS,
@@ -40,22 +41,29 @@ from .socks5 import _socks5_handshake
 from .tls_records import TLSRecordUnwrapper, TLSRecordWriter
 from .utils import _apply_tcp_tuning, _hex, log
 
+if TYPE_CHECKING:
+    from .web.tunnel import WebStream, WebTunnel
+
 
 async def _handle_client(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, cfg: BridgeConfig
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    cfg: BridgeConfig,
+    web_tunnel: "WebTunnel | None" = None,
 ) -> None:
     """Обрабатывает одно клиентское соединение: SOCKS5 → tunnel → relay.
 
     Pipeline:
         1. SOCKS5 handshake, вычисление DC ID;
-        2. TCP-подключение к upstream;
-        3. FakeTLS handshake (если ee-секрет);
+        2. туннель до MTProxy — прямой TCP либо WEB-поток релея;
+        3. FakeTLS handshake (если ee-секрет; только для прямого режима);
         4. obfuscated2 header + первые байты клиента;
         5. bidirectional relay с activity timeout.
 
     Любая ошибка на этапах 1-4 рвёт соединение без relay.
     """
     upstream_writer = None
+    stream: WebStream | None = None
     client_addr = writer.get_extra_info("peername")
     log.info(f"[client {client_addr}] New connection")
 
@@ -137,34 +145,60 @@ async def _handle_client(
                 return
             log.info(f"[client {client_addr}] DC ID resolved: {dc}")
 
-        try:
-            log.info(
-                f"[client {client_addr}] Connecting to upstream {cfg.upstream_host}:{cfg.upstream_port}..."
-            )
+        # --- Туннель до MTProxy -------------------------------------------
+        if cfg.web_link is not None:
+            # WEB-режим: вместо TCP-соединения — логический поток в
+            # мультиплексированной WEB-сессии (создаётся лениво).
+            if web_tunnel is None:
+                log.error(
+                    f"[client {client_addr}] Internal error: "
+                    f"WEB link without an initialized tunnel"
+                )
+                writer.close()
+                return
             try:
-                upstream_reader, upstream_writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        cfg.upstream_host, cfg.upstream_port
-                    ),
-                    timeout=UPSTREAM_CONNECT_TIMEOUT_SECS,
+                log.info(f"[client {client_addr}] Opening WEB stream...")
+                stream = await web_tunnel.open_stream()
+            except Exception as e:
+                log.error(
+                    f"[client {client_addr}] WEB stream open failed: {e}"
                 )
-            except asyncio.TimeoutError:
-                raise OSError(
-                    f"upstream connect timeout ({UPSTREAM_CONNECT_TIMEOUT_SECS}s) "
-                    f"to {cfg.upstream_host}:{cfg.upstream_port}"
+                writer.close()
+                return
+            log.info(
+                f"[client {client_addr}] WEB stream {stream.stream_id} opened"
+            )
+        else:
+            try:
+                log.info(
+                    f"[client {client_addr}] Connecting to upstream {cfg.upstream_host}:{cfg.upstream_port}..."
                 )
-            _apply_tcp_tuning(upstream_writer, client_addr)
-            log.info(f"[client {client_addr}] TCP connection to upstream established")
-        except OSError as e:
-            log.error(f"[client {client_addr}] Failed to connect to upstream: {e}")
-            writer.close()
-            return
+                try:
+                    upstream_reader, upstream_writer = await asyncio.wait_for(
+                        asyncio.open_connection(
+                            cfg.upstream_host, cfg.upstream_port
+                        ),
+                        timeout=UPSTREAM_CONNECT_TIMEOUT_SECS,
+                    )
+                except asyncio.TimeoutError:
+                    raise OSError(
+                        f"upstream connect timeout ({UPSTREAM_CONNECT_TIMEOUT_SECS}s) "
+                        f"to {cfg.upstream_host}:{cfg.upstream_port}"
+                    )
+                _apply_tcp_tuning(upstream_writer, client_addr)
+                log.info(f"[client {client_addr}] TCP connection to upstream established")
+            except OSError as e:
+                log.error(f"[client {client_addr}] Failed to connect to upstream: {e}")
+                writer.close()
+                return
 
         tls_writer: TLSRecordWriter | None = None
         server_initial_appdata = b""
 
         try:
-            if cfg.is_fake_tls:
+            if stream is not None and cfg.web_link is not None:
+                pass  # WEB-режим: FakeTLS невозможен (только plain/dd секреты)
+            elif cfg.is_fake_tls:
                 log.info(f"[client {client_addr}] Starting FakeTLS handshake...")
                 server_initial_appdata = await async_faketls_handshake(
                     upstream_reader, upstream_writer, cfg.domain, cfg.secret_key,
@@ -190,13 +224,21 @@ async def _handle_client(
                 f"[client {client_addr}] First encrypted chunk: {len(first_encrypted)} bytes"
             )
 
-            if cfg.is_fake_tls:
+            if stream is not None:
+                # Всё уходит одним DATA-потоком: header идёт в первой записи.
+                await stream.write(keys.header + first_encrypted)
+                log.debug(
+                    f"[client {client_addr}] Sent via WEB stream: "
+                    f"{len(keys.header) + len(first_encrypted)} bytes"
+                )
+            elif cfg.is_fake_tls:
                 wrapped = tls_writer.wrap(keys.header, first_encrypted)
                 upstream_writer.write(wrapped)
                 log.debug(
                     f"[client {client_addr}] Sent upstream (TLS-wrapped): "
                     f"{len(wrapped)} bytes"
                 )
+                await upstream_writer.drain()
             else:
                 upstream_writer.write(keys.header)
                 if first_encrypted:
@@ -205,7 +247,7 @@ async def _handle_client(
                     f"[client {client_addr}] Sent upstream (raw): "
                     f"{len(keys.header) + len(first_encrypted)} bytes"
                 )
-            await upstream_writer.drain()
+                await upstream_writer.drain()
         except Exception as e:
             log.exception(f"[client {client_addr}] Tunnel setup error: {e}")
             if upstream_writer:
@@ -213,7 +255,7 @@ async def _handle_client(
             writer.close()
             return
 
-        unwrapper = TLSRecordUnwrapper() if cfg.is_fake_tls else None
+        unwrapper = TLSRecordUnwrapper() if (cfg.is_fake_tls and stream is None) else None
 
         # server_initial_appdata — это AppData-body из FakeTLS handshake
         # (HMAC-верификация), НЕ obfuscated2 данные. TDLib также не
@@ -227,8 +269,42 @@ async def _handle_client(
 
         log.info(f"[client {client_addr}] Tunnel established, starting relay")
 
+        # --- Адаптеры транспорта (direct TCP или WEB-поток) ----------------
+        if stream is not None:
+
+            async def send_upstream(encrypted: bytes) -> None:
+                await stream.write(encrypted)
+
+            async def recv_upstream() -> tuple[bytes, bool]:
+                """Возвращает ``(расшифрованные_байты, eof)``."""
+                try:
+                    chunk = await asyncio.wait_for(
+                        stream.read(), timeout=ACTIVITY_TIMEOUT_SECS
+                    )
+                except asyncio.TimeoutError:
+                    raise
+                return chunk, not chunk  # b"" ⇒ CLOSE/EOF потока
+
+        else:
+
+            async def send_upstream(encrypted: bytes) -> None:
+                if cfg.is_fake_tls and tls_writer:
+                    upstream_writer.write(tls_writer.wrap(b"", encrypted))
+                else:
+                    upstream_writer.write(encrypted)
+                await upstream_writer.drain()
+
+            async def recv_upstream() -> tuple[bytes, bool]:
+                data = await asyncio.wait_for(
+                    upstream_reader.read(65536), timeout=ACTIVITY_TIMEOUT_SECS
+                )
+                if not data:
+                    return b"", True
+                plain_wire = unwrapper.feed(data) if unwrapper else data
+                return plain_wire, False
+
         async def client_to_upstream() -> None:
-            """Relay: client → obfuscated2 encrypt → upstream (TLS-wrapped если FakeTLS)."""
+            """Relay: client → obfuscated2 encrypt → tunnel (TLS-wrapped если FakeTLS)."""
             try:
                 while True:
                     try:
@@ -247,42 +323,39 @@ async def _handle_client(
                         )
                         break
                     enc = keys.encryptor.update(data)
-                    if cfg.is_fake_tls and tls_writer:
-                        upstream_writer.write(tls_writer.wrap(b"", enc))
-                    else:
-                        upstream_writer.write(enc)
-                    await upstream_writer.drain()
+                    await send_upstream(enc)
                     log.debug(f"[client {client_addr}] client->upstream: {len(data)} bytes")
             except (ConnectionResetError, BrokenPipeError) as e:
                 log.debug(f"[client {client_addr}] client->upstream: {e}")
             except Exception as e:
                 log.exception(f"[client {client_addr}] client->upstream error: {e}")
             finally:
-                try:
-                    upstream_writer.close()
-                except Exception:
-                    pass
+                if stream is not None:
+                    stream.close()
+                elif upstream_writer is not None:
+                    try:
+                        upstream_writer.close()
+                    except Exception:
+                        pass
 
         async def upstream_to_client() -> None:
-            """Relay: upstream → TLS-unwrap (если FakeTLS) → obfuscated2 decrypt → client."""
+            """Relay: tunnel → TLS-unwrap (если FakeTLS) → obfuscated2 decrypt → client."""
             try:
                 while True:
                     try:
-                        data = await asyncio.wait_for(
-                            upstream_reader.read(65536), timeout=ACTIVITY_TIMEOUT_SECS
-                        )
+                        plain_wire, eof = await recv_upstream()
                     except asyncio.TimeoutError:
                         log.warning(
                             f"[client {client_addr}] upstream->client: no activity for "
                             f"{ACTIVITY_TIMEOUT_SECS}s — closing by activity timeout"
                         )
                         break
-                    if not data:
+                    if eof:
                         log.info(
-                            f"[client {client_addr}] Upstream closed connection (read returned empty)"
+                            f"[client {client_addr}] Upstream closed connection "
+                            f"(read returned empty)"
                         )
                         break
-                    plain_wire = unwrapper.feed(data) if unwrapper else data
                     if plain_wire:
                         dec = keys.decryptor.update(plain_wire)
                         writer.write(dec)
@@ -310,7 +383,9 @@ async def _handle_client(
         log.info(f"[client {client_addr}] Connection closed")
         try:
             writer.close()
-            if upstream_writer:
+            if stream is not None:
+                stream.close()  # CLOSE наружу — best-effort
+            elif upstream_writer is not None:
                 upstream_writer.close()
         except Exception:
             pass

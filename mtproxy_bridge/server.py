@@ -23,13 +23,16 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from .config import SHUTDOWN_GRACE_SECS, BridgeConfig
-from .links import parse_tg_link
+from .links import is_web_proxy_link, parse_tg_link, parse_web_link
 from .obfuscated2 import TAG_ABRIDGED, TAG_PADDED_INTERMEDIATE
 from .relay import _handle_client
 from .utils import log
+
+if TYPE_CHECKING:
+    from .web.tunnel import WebTunnel
 
 # ============================================================================
 # Корректное (graceful) завершение
@@ -45,6 +48,7 @@ from .utils import log
 
 def _make_connection_tracker(
     cfg: BridgeConfig,
+    web_tunnel: WebTunnel | None = None,
 ) -> tuple[
     Callable[[asyncio.StreamReader, asyncio.StreamWriter], None],
     set[asyncio.Task],
@@ -62,7 +66,9 @@ def _make_connection_tracker(
     def _client_connected(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        task = asyncio.create_task(_handle_client(reader, writer, cfg))
+        task = asyncio.create_task(
+            _handle_client(reader, writer, cfg, web_tunnel)
+        )
 
         def _on_done(t: asyncio.Task) -> None:
             active.discard(t)
@@ -153,7 +159,9 @@ def _install_shutdown_handler(stop_event: asyncio.Event) -> None:
         signal.signal(signal.SIGINT, _sync_handler)
 
 
-async def run_bridge(cfg: BridgeConfig) -> None:
+async def run_bridge(
+    cfg: BridgeConfig, *, web_tunnel: WebTunnel | None = None
+) -> None:
     """Start a blocking SOCKS5 server (CLI mode).
 
     Runs until SIGINT/SIGTERM, then shuts down gracefully: stops accepting
@@ -164,7 +172,9 @@ async def run_bridge(cfg: BridgeConfig) -> None:
     stop_event = asyncio.Event()
     _install_shutdown_handler(stop_event)
 
-    client_connected_cb, active_connections = _make_connection_tracker(cfg)
+    client_connected_cb, active_connections = _make_connection_tracker(
+        cfg, web_tunnel
+    )
     server = await asyncio.start_server(
         client_connected_cb, cfg.listen_host, cfg.listen_port
     )
@@ -177,59 +187,71 @@ async def run_bridge(cfg: BridgeConfig) -> None:
             else f"unknown ({cfg.expected_tag.hex()})"
         )
     )
-    print(
-        f"SOCKS5 bridge listening on \n\nsocks5://{cfg.listen_host}:{cfg.listen_port}\n\n"
-        f"tunnel to {cfg.upstream_host}:{cfg.upstream_port} "
-        f"({'FakeTLS' if cfg.is_fake_tls else 'plain obfuscated2'})"
-    )
-    print(
-        f"transport={transport_name}, "
-        f"send_ccs={cfg.send_ccs}, use_block_m={cfg.use_block_m}, "
-        f"use_block_e={cfg.use_block_e}"
-    )
+    print(f"SOCKS5 bridge listening on \n\nsocks5://{cfg.listen_host}:{cfg.listen_port}\n")
+    if cfg.web_link is not None:
+        secret_mode = "dd (random padding)" if cfg.web_link.is_padded else "plain"
+        print(
+            f"WEB proxy tunnel via https://{cfg.web_link.host} "
+            f"(secret={secret_mode})"
+        )
+    else:
+        print(
+            f"tunnel to {cfg.upstream_host}:{cfg.upstream_port} "
+            f"({'FakeTLS' if cfg.is_fake_tls else 'plain obfuscated2'})"
+        )
+    print(f"transport={transport_name}")
 
     await stop_event.wait()
     log.info("Stopping listener, no new connections will be accepted...")
     await _shutdown_server(server, active_connections)
+    if web_tunnel is not None:
+        log.info("Closing WEB tunnel...")
+        try:
+            await web_tunnel.aclose()
+        except Exception as exc:  # pragma: no cover - защита остановки
+            log.warning(f"WEB tunnel close error: {exc!r}")
     log.info("Bridge stopped.")
 
 
-# Сервер → множество активных задач-обработчиков (см. _make_connection_tracker).
-# Хранятся именно клиентские задачи, чтобы stop_all_bridges могла дождаться каждой.
-_running_servers: dict[asyncio.Server, set[asyncio.Task]] = {}
+# Сервер → (множество активных задач-обработчиков, WEB-туннель или None).
+# Хранятся именно клиентские задачи, чтобы stop_all_bridges могла дождаться
+# каждой; WEB-туннель закрывается вместе со своим сервером.
+_running_bridges: dict[asyncio.Server, tuple[set[asyncio.Task], WebTunnel | None]] = {}
 
 
-async def start_local_bridge(
+def _build_bridge_config(
     tg_link: str,
-    listen_host: str = "127.0.0.1",
-    listen_port: int = 0,
-    dc_id_override: int = 0,
-    send_ccs: bool = True,
-    use_block_m: bool = True,
-    use_block_e: bool = True,
-) -> int:
-    """Start the bridge as a background asyncio task and return the local port.
-
-    Intended for embedding into an application (e.g. before starting a
-    Pyrogram/Kurigram client). To stop all background bridges, call
-    :func:`stop_all_bridges` — e.g. from your own SIGINT/SIGTERM handler or
-    shutdown path; this module does not install signal handlers of its own
-    in library mode, so as not to clobber a host application's handlers.
-
-    Args:
-        tg_link: ``tg://proxy?server=...&port=...&secret=...``.
-        listen_host: SOCKS5 host (default 127.0.0.1).
-        listen_port: port; 0 = pick a free one automatically.
-        dc_id_override: explicit DC ID (escape hatch; 0 = auto).
-        send_ccs: Send CCS (TDLib ``first_prefix``) before the first AppData record.
-        use_block_m: Use block M (Kyber-like) in ClientHello.
-        use_block_e: Use block E (random extra) in ClientHello.
-
-    Returns:
-        The actual port the bridge is listening on.
-    """
+    listen_host: str,
+    listen_port: int,
+    dc_id_override: int,
+    send_ccs: bool,
+    use_block_m: bool,
+    use_block_e: bool,
+    web_origin: str | None,
+) -> BridgeConfig:
+    """Разбирает ссылку (tg://proxy либо tg://webproxy) в BridgeConfig."""
+    if is_web_proxy_link(tg_link):
+        web_link = parse_web_link(tg_link)
+        return BridgeConfig(
+            listen_host=listen_host,
+            listen_port=listen_port,
+            upstream_host="",
+            upstream_port=0,
+            secret_key=web_link.secret_key,
+            domain="",
+            is_fake_tls=False,
+            expected_tag=(
+                TAG_PADDED_INTERMEDIATE if web_link.is_padded else TAG_ABRIDGED
+            ),
+            dc_id_override=dc_id_override,
+            send_ccs=send_ccs,
+            use_block_m=use_block_m,
+            use_block_e=use_block_e,
+            web_link=web_link,
+            web_origin=web_origin,
+        )
     link = parse_tg_link(tg_link)
-    cfg = BridgeConfig(
+    return BridgeConfig(
         listen_host=listen_host,
         listen_port=listen_port,
         upstream_host=link.server,
@@ -243,11 +265,60 @@ async def start_local_bridge(
         use_block_m=use_block_m,
         use_block_e=use_block_e,
     )
-    client_connected_cb, active_connections = _make_connection_tracker(cfg)
+
+
+async def start_local_bridge(
+    tg_link: str,
+    listen_host: str = "127.0.0.1",
+    listen_port: int = 0,
+    dc_id_override: int = 0,
+    send_ccs: bool = True,
+    use_block_m: bool = True,
+    use_block_e: bool = True,
+    web_origin: str | None = None,
+) -> int:
+    """Start the bridge as a background asyncio task and return the local port.
+
+    Intended for embedding into an application (e.g. before starting a
+    Pyrogram/Kurigram client). Accepts both classic MTProto links
+    (``tg://proxy?server=...&port=...&secret=...``) and WEB proxy links
+    (``tg://webproxy?server=...&secret=...``). To stop all background
+    bridges, call :func:`stop_all_bridges` — e.g. from your own
+    SIGINT/SIGTERM handler or shutdown path; this module does not install
+    signal handlers of its own in library mode, so as not to clobber a host
+    application's handlers.
+
+    Args:
+        tg_link: MTProto or WEB proxy link.
+        listen_host: SOCKS5 host (default 127.0.0.1).
+        listen_port: port; 0 = pick a free one automatically.
+        dc_id_override: explicit DC ID (escape hatch; 0 = auto).
+        send_ccs: Send CCS (TDLib ``first_prefix``) before the first AppData
+            record (direct FakeTLS mode only).
+        use_block_m: Use block M (Kyber-like) in ClientHello (direct mode).
+        use_block_e: Use block E (random extra) in ClientHello (direct mode).
+        web_origin: override the WEB relay origin (default
+            ``https://<host>``); useful for tests and non-standard deploys.
+
+    Returns:
+        The actual port the bridge is listening on.
+    """
+    cfg = _build_bridge_config(
+        tg_link, listen_host, listen_port, dc_id_override,
+        send_ccs, use_block_m, use_block_e, web_origin,
+    )
+    tunnel: WebTunnel | None = None
+    if cfg.web_link is not None:
+        from .web.tunnel import WebTunnel
+
+        tunnel = WebTunnel(cfg.web_link, origin=cfg.web_origin)
+    client_connected_cb, active_connections = _make_connection_tracker(
+        cfg, tunnel
+    )
     server = await asyncio.start_server(client_connected_cb, listen_host, listen_port)
     actual_port = server.sockets[0].getsockname()[1]
 
-    _running_servers[server] = active_connections
+    _running_bridges[server] = (active_connections, tunnel)
 
     return actual_port
 
@@ -255,18 +326,28 @@ async def start_local_bridge(
 async def stop_all_bridges() -> None:
     """Gracefully stop all background bridges started via :func:`start_local_bridge`.
 
-    For each bridge: stops accepting new connections, then cancels and
-    waits (up to ``SHUTDOWN_GRACE_SECS`` per bridge, all bridges in
-    parallel) for already-open client connections to close their sockets.
+    For each bridge: stops accepting new connections, cancels and waits
+    (up to ``SHUTDOWN_GRACE_SECS`` per bridge, all bridges in parallel)
+    for already-open client connections, then closes the WEB tunnel (if any).
     """
-    if not _running_servers:
+    if not _running_bridges:
         return
 
+    async def _stop_one(
+        server: asyncio.Server,
+        active_connections: set[asyncio.Task],
+        tunnel: WebTunnel | None,
+    ) -> None:
+        await _shutdown_server(server, active_connections)
+        if tunnel is not None:
+            try:
+                await tunnel.aclose()
+            except Exception as exc:
+                log.warning(f"WEB tunnel close error: {exc!r}")
+
+    bridges = list(_running_bridges.items())
+    _running_bridges.clear()
     await asyncio.gather(
-        *(
-            _shutdown_server(server, active_connections)
-            for server, active_connections in _running_servers.items()
-        ),
+        *(_stop_one(server, conns, tunnel) for server, (conns, tunnel) in bridges),
         return_exceptions=True,
     )
-    _running_servers.clear()

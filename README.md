@@ -6,19 +6,22 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
 ![Status](https://img.shields.io/badge/status-beta-yellow.svg)
 
-> Локальный SOCKS5-мост для Telegram MTProto-прокси (FakeTLS / obfuscated2). Логика хендшейка портирована из C++ **TDLib** — официальной кросс-платформенной библиотеки Telegram, поэтому трафик неотличим от настоящего клиента.
+> Локальный SOCKS5-мост для Telegram MTProto-прокси (FakeTLS / obfuscated2) и нового типа **WEB Proxy** (`tg://webproxy`). Логика хендшейка портирована из C++ **TDLib** — официальной кросс-платформенной библиотеки Telegram, поэтому трафик неотличим от настоящего клиента.
 
 ## Зачем это нужно
 
 Ссылки вида `tg://proxy?server=...&port=...&secret=...` (и `https://t.me/proxy?...`) задают Telegram MTProto-прокси — сервер, с которым клиент говорит на протоколе, замаскированном под TLS (FakeTLS) либо обфусцированном (obfuscated2). 
 
-Kurigram и подобные клиенты такой протокол не понимают, зато умеют работать через обычный SOCKS5.
+Новый тип `tg://webproxy?server=...&secret=...` (WEB Proxy) не имеет выделенного TCP-порта: MTProto-трафик мультиплексируется через HTTPS/WebSocket-carrier-сессию до WEB-релея.
 
-`mtproxy-bridge` поднимает локальный SOCKS5-сервер, сам проводит хендшейк с прокси и отдаёт клиенту привычный SOCKS5-сокет; дальше байты пробрасываются как есть, без повторного шифрования или разбора MTProto поверх.
+Kurigram и подобные клиенты такие протоколы не понимают, зато умеют работать через обычный SOCKS5.
+
+`mtproxy-bridge` поднимает локальный SOCKS5-сервер, сам проводит хендшейк с прокси (или держит WEB-сессию с релеем) и отдаёт клиенту привычный SOCKS5-сокет; дальше байты пробрасываются как есть, без повторного шифрования или разбора MTProto поверх.
 
 ## Возможности
 
 - **Автоопределение транспорта** — тип секрета (`dd` / `ee` / голый 16-байтовый) определяется автоматически; нужный клиенту транспорт отдаёт `needs_padded_transport()`.
+- **Поддержка WEB Proxy** — ссылки `tg://webproxy` / `t.me/webproxy`: bridge-capability из HMAC(секрет), bootstrap через страницу релея, все 4 carrier-режима (`https`, `https-lanes`, `websocket`, `websocket-lanes`), flow-control окна 4 МиБ.
 - **Точная эмуляция TDLib** — ClientHello (GREASE-значения, блоки M/E, X25519-ключ) собирается по тем же правилам, что и `TlsHello::get_default`.
 - **Автоопределение DC** — по IP или hostname через встроенную таблицу дата-центров (аналог `ConnectionCreator::get_default_dc_options`); есть ручной override.
 - **CLI и библиотека** — разовый запуск из терминала или встраивание в приложение перед созданием Kurigram-клиента.
@@ -30,7 +33,7 @@ Kurigram v2.2.25+
 
 Также возможно с иными клиентами, кто поддерживает [TCP Padded Intermediate](https://core.telegram.org/mtproto/mtproto-transports#padded-intermediate)
 
-Python 3.9+, единственная внешняя зависимость — `cryptography`:
+Python 3.9+, внешние зависимости — `cryptography` и `aiohttp`:
 
 ```bash
 pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
@@ -50,13 +53,16 @@ pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
 
 Пустой secret (TDLib plain TCP) не поддерживается.
 
+Для WEB Proxy (`tg://webproxy`) поддерживаются только `plain` (16 байт) и `dd`; `ee`/FakeTLS в WEB-режиме не существует.
+
 ## Использование как библиотека
 
 Основной сценарий — встраивание перед созданием Telegram-клиента. Публичный API:
 
-- `is_mtproto_link(url)` — проверяет это `tg://proxy` / `t.me/proxy` или обычный прокси;
+- `is_mtproto_link(url)` — проверяет это `tg://proxy` / `t.me/proxy` / `tg://webproxy` или обычный прокси;
+- `is_web_proxy_link(url)` — проверяет WEB-ссылку отдельно;
 - `needs_padded_transport(url)` — проверяет нужен ли клиенту padded-транспорт;
-- `start_local_bridge(tg_link, ...)` — поднимает мост фоном, возвращает локальный порт;
+- `start_local_bridge(tg_link, ...)` — поднимает мост фоном, возвращает локальный порт (тип ссылки определяется автоматически);
 - `stop_all_bridges()` — останавливает все мосты.
 
 Пример юзербота с Kurigram:
@@ -105,6 +111,18 @@ if __name__ == "__main__":
 
 Невалидная ссылка или secret — `ValueError`; вызов стоит оборачивать в `try/except`, как в примере. Чтобы погасить мосты (например, в своём обработчике `SIGINT`/`SIGTERM`), вызовите `stop_all_bridges()`.
 
+### WEB Proxy
+
+Пример работает без изменений, если в `MTPROXY` подставить WEB-ссылку:
+
+```python
+MTPROXY = "tg://webproxy?server=proxy.example.com&secret=dd0123456789abcdef0123456789abcdef"
+```
+
+Мост сам выведет bridge-capability (HMAC-SHA256 от hostname+секрета), получит bootstrap со страницы релея, создаст сессию и выберет carrier-режим, объявленный сервером (`https`, `https-lanes`, `websocket`, `websocket-lanes`). При смерти carrier-сессии она пересоздаётся лениво при следующем соединении клиента.
+
+Для нестандартных деплоев и тестов у `start_local_bridge` есть параметр `web_origin=` — переопределить `https://<host>` на произвольный origin.
+
 ## Использование через CLI
 
 Не основной способ использования. Пример:
@@ -130,13 +148,13 @@ ___
 
 | Параметр            | По умолчанию              | Описание |
 |---------------------|----------------------------|----------|
-| `tg_link`           | — (обязателен)             | `tg://proxy?server=...&port=...&secret=...` |
+| `tg_link`           | — (обязателен)             | `tg://proxy?server=...&port=...&secret=...` или `tg://webproxy?server=...&secret=...` |
 | `--listen-host`     | `127.0.0.1`                 | Хост локального SOCKS5-сервера |
 | `--listen-port`     | `1080`                      | Порт локального SOCKS5-сервера |
 | `--dc-id-override`  | автоопределение             | Явно задать DC ID, если автоопределение не сработало |
-| `--no-ccs`          | выкл. (CCS отправляется)    | Не слать CCS (TDLib `first_prefix`) перед первым AppData-рекордом |
-| `--no-block-m`      | выкл. (блок включён)        | Отключить блок M (Kyber-like) в ClientHello |
-| `--no-block-e`      | выкл. (блок включён)        | Отключить блок E в ClientHello |
+| `--no-ccs`          | выкл. (CCS отправляется)    | Не слать CCS (TDLib `first_prefix`) перед первым AppData-рекордом (только прямой режим) |
+| `--no-block-m`      | выкл. (блок включён)        | Отключить блок M (Kyber-like) в ClientHello (только прямой режим) |
+| `--no-block-e`      | выкл. (блок включён)        | Отключить блок E в ClientHello (только прямой режим) |
 | `--debug`           | выкл.                       | DEBUG-логирование |
 
 ### Настоятельно рекомендуется не выключать CCS, блок E или M без явной необходимости!
@@ -145,6 +163,7 @@ ___
 
 - SOCKS5-сервер моста поддерживает только no-auth и команду `CONNECT` — этого достаточно для локального использования, но не делает его многопользовательским прокси.
 - DC ID ищется по встроенной таблице известных IP/доменов; если хост не резолвится или отсутствует в таблице, нужен `--dc-id-override`.
+- WEB-режим: carrier-режим выбирает сервер; при смерти сессии активные соединения клиентов рвутся и переподнимаются на новой сессии (как в референсном клиенте Telegram).
 
 ## Лицензия
 
