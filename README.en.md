@@ -44,7 +44,7 @@ pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
 pip install "mtproxy-bridge[web] @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git"
 
 # pinned version
-pip install "mtproxy-bridge[web] @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git@v0.3.0"
+pip install "mtproxy-bridge[web] @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git@v0.3.1"
 ```
 
 Without the `[web]` extra, `tg://webproxy` links do not work: the CLI prints a
