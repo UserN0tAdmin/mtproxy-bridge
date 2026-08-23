@@ -33,6 +33,7 @@ classifiers = [
     "Framework :: AsyncIO",
 ]
 dependencies = [
+    "aiohttp>=3.9",
     "cryptography>=43.0",
 ]
 
@@ -42,7 +43,7 @@ Repository = "https://github.com/UserN0tAdmin/mtproxy-bridge"
 Issues = "https://github.com/UserN0tAdmin/mtproxy-bridge/issues"
 
 [project.scripts]
-mtproxy-bridge = "mtproxy_bridge:main"
+mtproxy-bridge = "mtproxy_bridge.cli:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["mtproxy_bridge.py"]
+include = ["mtproxy_bridge"]
