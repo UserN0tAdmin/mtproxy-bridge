@@ -26,9 +26,14 @@
 
     const relayOrigin="https://H",bootstrap="<token>",carrierMode="<mode>";
 
-Telemt рендерит совместимую страницу с теми же эндпоинтами; парсер сделан
-терпимым к регистру и разделителям (``=``/``:``), но строгим к формату
-значений.
+Telemt рендерит ту же страницу в своём варианте (src/web/bridge.rs) —
+переменная carrier объявлена без слова «mode» и в одинарных кавычках:
+
+    const relayOrigin='https://H',bootstrap='<token>',carrier='<mode>';
+
+Парсер терпим к регистру, разделителям (``=``/``:``) и кавычкам, но строг
+к формату значений; строки вида ``carrier==='websocket'`` (сравнение)
+не матчатся из-за двойного ``=`` перед значением.
 """
 
 from __future__ import annotations
@@ -49,7 +54,7 @@ _TOKEN_RE = re.compile(
     r"""bootstrap["']?\s*[:=]\s*["']([A-Za-z0-9_-]{43})["']""", re.IGNORECASE
 )
 _CARRIER_MODE_RE = re.compile(
-    r"""carrier[a-z_-]{0,3}mode["']?\s*[:=]\s*["']([a-z-]+)["']""",
+    r"""carrier(?:[_-]?mode)?["']?\s*[:=]\s*["']([a-z-]+)["']""",
     re.IGNORECASE,
 )
 _BATCH_LIMIT_RE = re.compile(
