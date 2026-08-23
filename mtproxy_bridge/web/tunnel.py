@@ -177,6 +177,7 @@ class WebTunnel:
         self._streams: dict[int, WebStream] = {}
         self._next_stream_id = 1
         self._setup_lock = asyncio.Lock()
+        self._setup_task: asyncio.Task | None = None
         self._closed = False
         self._bg_tasks: set[asyncio.Task] = set()
 
@@ -193,10 +194,12 @@ class WebTunnel:
 
     async def open_stream(self) -> WebStream:
         """Открывает новый логический поток (OPEN уходит после регистрации)."""
+        if self._closed:
+            raise TunnelClosed("web tunnel is closed")
+        await self._ensure_session()
         async with self._setup_lock:
             if self._closed:
                 raise TunnelClosed("web tunnel is closed")
-            await self._ensure_session()
             stream_id = self._alloc_stream_id()
             stream = WebStream(self, stream_id)
             self._streams[stream_id] = stream
@@ -255,6 +258,10 @@ class WebTunnel:
         if self._closed:
             return
         self._closed = True
+        setup_task = self._setup_task
+        if setup_task is not None and not setup_task.done():
+            setup_task.cancel()
+            await asyncio.gather(setup_task, return_exceptions=True)
         streams = list(self._streams.values())
         self._streams.clear()
         for stream in streams:
@@ -392,13 +399,37 @@ class WebTunnel:
                 await carrier.aclose(grace=grace)
 
     async def _ensure_session(self) -> None:
-        """Гарантирует живую сессию (лениво пересоздаёт после сбоя)."""
+        """Гарантирует живую сессию; bootstrap выполняется в один заход.
+
+        Single-flight: пока идёт установка сессии, все новые открыватели
+        присоединяются к одному in-flight bootstrap'у через shield —
+        отмена одного ожидающего (например, по дедлайну relay-слоя) не
+        убивает установку для остальных. Провал достаётся всем текущим
+        ожидающим сразу; первый вызывающий после провала начинает новую
+        попытку (туннель не «отравляется»).
+        """
         if (
             self._carrier is not None
             and self._carrier.failed is None
             and not self._closed
         ):
             return
+        task = self._setup_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._bootstrap_session())
+            self._setup_task = task
+
+            def _consume(t: asyncio.Task) -> None:
+                # Отмечаем исключение полученным, чтобы asyncio не ругался,
+                # если все ожидающие к моменту провала уже разошлись.
+                if not t.cancelled():
+                    t.exception()
+
+            task.add_done_callback(_consume)
+        await asyncio.shield(task)
+
+    async def _bootstrap_session(self) -> None:
+        """Полный цикл установки: страница → HELLO/WELCOME → carrier."""
         await self._teardown_carrier()
         self._session_token = ""
 
@@ -438,7 +469,12 @@ class WebTunnel:
             on_failure=self._on_carrier_failure,
             on_stream_reset=self._on_stream_reset,
         )
-        await carrier.start()
+        try:
+            await carrier.start()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await carrier.aclose(grace=0.0)
+            raise
         self._carrier = carrier
         self._session_token = token
         self._carrier_mode = announced_mode

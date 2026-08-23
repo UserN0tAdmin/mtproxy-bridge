@@ -19,6 +19,7 @@ server-side obfuscated2 (как официальный MTProxy).
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import os
 import time
@@ -140,6 +141,10 @@ class MockRelay:
         self.bootstrap_token = _random_token()
         self.session_token = _random_token()
         self.session: _Session | None = None
+        # Инструментарий тестов bootstrap'а: счётчик GET / и опциональная
+        # «заглушка», удерживающая выдачу страницы до set().
+        self.page_requests = 0
+        self.hold_page: asyncio.Event | None = None
 
     def make_app(self) -> web.Application:
         app = web.Application(client_max_size=8 * 1024 * 1024)
@@ -155,6 +160,9 @@ class MockRelay:
     # HTTP endpoints
 
     async def handle_root(self, request: web.Request) -> web.Response:
+        self.page_requests += 1
+        if self.hold_page is not None:
+            await self.hold_page.wait()
         if request.query.get("bridge") != self.capability or len(request.query) != 1:
             return web.Response(status=404, text="decoy")
         html = (
@@ -613,6 +621,52 @@ async def test_close_stream_delivers_close_to_relay(relay):
     assert stream.stream_id not in relay.session.writers
     # Ограничиваем уборку: против регрессии aclose не должен виснуть.
     await asyncio.wait_for(tunnel.aclose(), timeout=15)
+
+
+async def test_concurrent_openers_share_single_failed_bootstrap(relay):
+    """Single-flight bootstrap: N одновременных open_stream при недоступном
+    релее делят одну попытку установки сессии, а не гоняют по своей."""
+    link = parse_web_link(f"tg://webproxy?server={HOST}&secret={SECRET_HEX}")
+    tunnel = WebTunnel(link, origin=f"http://127.0.0.1:{relay.port}")
+    relay.capability = "wrong"  # GET / → 404 decoy → BootstrapRejected
+
+    results = await asyncio.gather(
+        *(tunnel.open_stream() for _ in range(6)), return_exceptions=True
+    )
+    assert all(isinstance(r, BootstrapRejected) for r in results)
+    assert len({id(r) for r in results}) == 1  # один и тот же провал у всех
+    assert relay.page_requests == 1
+
+    # После провала туннель не «отравлен»: новый вызывающий начинает новую
+    # попытку, которая успешно проходит.
+    relay.capability = link.capability
+    stream = await tunnel.open_stream()
+    assert stream.stream_id == 1
+    assert relay.page_requests == 2
+    await tunnel.aclose()
+
+
+async def test_waiter_cancellation_keeps_shared_bootstrap(relay):
+    """Отмена одного ожидающего (например, по дедлайну relay-слоя) не убивает
+    общий in-flight bootstrap — остальные присоединяются и дожидаются его."""
+    tunnel = _make_tunnel(relay)
+    relay.hold_page = asyncio.Event()
+
+    t1 = asyncio.create_task(tunnel.open_stream())
+    await asyncio.sleep(0.1)  # t1 успевает начать bootstrap (страница удержана)
+    t1.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await t1
+
+    # Второй открыватель присоединяется к тому же in-flight bootstrap'у...
+    t2 = asyncio.create_task(tunnel.open_stream())
+    await asyncio.sleep(0.05)
+    relay.hold_page.set()
+    stream = await asyncio.wait_for(t2, timeout=5)
+    assert stream.stream_id == 1
+    # ...а не перезапускает установку заново.
+    assert relay.page_requests == 1
+    await tunnel.aclose()
 
 
 def test_pack_batch_split_keeps_item_accounting_balanced():

@@ -27,6 +27,7 @@ from .config import (
     ACTIVITY_TIMEOUT_SECS,
     SOCKS5_HANDSHAKE_TIMEOUT_SECS,
     UPSTREAM_CONNECT_TIMEOUT_SECS,
+    WEB_STREAM_OPEN_TIMEOUT_SECS,
     BridgeConfig,
 )
 from .dc import guess_dc_id_async
@@ -158,7 +159,20 @@ async def _handle_client(
                 return
             try:
                 log.info(f"[client {client_addr}] Opening WEB stream...")
-                stream = await web_tunnel.open_stream()
+                # Дедлайн на всё открытие (включая ожидание общей сессии):
+                # без него клиенты копятся в очереди к bootstrap'у, пока
+                # Kurigram плодит новые сокеты быстрее, чем они умирают.
+                stream = await asyncio.wait_for(
+                    web_tunnel.open_stream(),
+                    timeout=WEB_STREAM_OPEN_TIMEOUT_SECS,
+                )
+            except asyncio.TimeoutError:
+                log.error(
+                    f"[client {client_addr}] WEB stream open timed out "
+                    f"after {WEB_STREAM_OPEN_TIMEOUT_SECS}s"
+                )
+                writer.close()
+                return
             except Exception as e:
                 log.error(
                     f"[client {client_addr}] WEB stream open failed: {e}"

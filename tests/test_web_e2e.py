@@ -22,6 +22,7 @@ WEB-поток до релея и обратную дорогу.
 
 import asyncio
 import os
+import time
 
 from test_web_integration import (  # noqa: F401
     HOST,
@@ -119,4 +120,38 @@ async def test_socks5_plain_secret_abridged(relay):  # noqa: F401, F811
 
         writer.close()
     finally:
+        await stop_all_bridges()
+
+
+async def test_socks5_client_dies_on_web_open_deadline(relay, monkeypatch):  # noqa: F811
+    """Регрессия «плодятся серверы»: при недоступном релее клиент закрывается
+    по дедлайну открытия WEB-стрима, а не висит в очереди к bootstrap'у."""
+    link_str = f"tg://webproxy?server={HOST}&secret={_DD_HEX}"
+    web_link = parse_web_link(link_str)
+    relay.capability = web_link.capability
+    relay.hold_page = asyncio.Event()  # bootstrap никогда не завершается
+
+    monkeypatch.setattr("mtproxy_bridge.relay.WEB_STREAM_OPEN_TIMEOUT_SECS", 0.3)
+
+    port = await start_local_bridge(
+        link_str, listen_port=0,
+        web_origin=f"http://127.0.0.1:{relay.port}",
+    )
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"\x05\x01\x00")
+        assert await reader.readexactly(2) == b"\x05\x00"
+        dc2_ip = bytes([149, 154, 167, 51])
+        writer.write(b"\x05\x01\x00\x01" + dc2_ip + (443).to_bytes(2, "big"))
+        reply = await reader.readexactly(10)
+        assert reply[:3] == b"\x05\x00\x00"
+        writer.write(bytes.fromhex("dddddddd") + b"x" * 16)
+
+        started = time.monotonic()
+        chunk = await asyncio.wait_for(reader.read(1024), timeout=10)
+        elapsed = time.monotonic() - started
+        assert chunk == b""  # мост сам закрыл соединение (EOF)
+        assert elapsed < 5   # быстро, а не после минут retry-циклов
+    finally:
+        relay.hold_page.set()  # отпускаем обработчик релея перед уборкой
         await stop_all_bridges()
