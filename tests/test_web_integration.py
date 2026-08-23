@@ -648,8 +648,12 @@ async def test_concurrent_openers_share_single_failed_bootstrap(relay):
 
 async def test_waiter_cancellation_keeps_shared_bootstrap(relay):
     """Отмена одного ожидающего (например, по дедлайну relay-слоя) не убивает
-    общий in-flight bootstrap — остальные присоединяются и дожидаются его."""
-    tunnel = _make_tunnel(relay)
+    общий in-flight bootstrap и не приводит к шумным логам цикла событий,
+    когда bootstrap позже падает без оставшихся ожидающих (Python 3.14
+    логирует исключение shield'а при отмене — потому ждём через wait)."""
+    link = parse_web_link(f"tg://webproxy?server={HOST}&secret={SECRET_HEX}")
+    tunnel = WebTunnel(link, origin=f"http://127.0.0.1:{relay.port}")
+    relay.capability = link.capability
     relay.hold_page = asyncio.Event()
 
     t1 = asyncio.create_task(tunnel.open_stream())
@@ -658,15 +662,35 @@ async def test_waiter_cancellation_keeps_shared_bootstrap(relay):
     with contextlib.suppress(asyncio.CancelledError):
         await t1
 
-    # Второй открыватель присоединяется к тому же in-flight bootstrap'у...
-    t2 = asyncio.create_task(tunnel.open_stream())
-    await asyncio.sleep(0.05)
-    relay.hold_page.set()
-    stream = await asyncio.wait_for(t2, timeout=5)
-    assert stream.stream_id == 1
-    # ...а не перезапускает установку заново.
-    assert relay.page_requests == 1
-    await tunnel.aclose()
+    # Ловим обращения к обработчику исключений цикла (шум shield/wait).
+    loop = asyncio.get_running_loop()
+    original_handler = loop.get_exception_handler()
+    loop_exceptions: list[dict] = []
+
+    def _record(_loop: asyncio.AbstractEventLoop, ctx: dict) -> None:
+        loop_exceptions.append(ctx)
+
+    try:
+        loop.set_exception_handler(_record)
+        # Второй открыватель присоединяется к тому же in-flight bootstrap'у.
+        t2 = asyncio.create_task(tunnel.open_stream())
+        await asyncio.sleep(0.05)
+        # После разрыва t1 релей «ломается»: провал достанется только t2.
+        relay.capability = "wrong"
+        relay.hold_page.set()
+
+        with pytest.raises(BootstrapRejected):
+            await asyncio.wait_for(t2, timeout=5)
+        # ...а не перезапускает установку заново.
+        assert relay.page_requests == 1
+
+        # Даём циклу разнести колбэки упавшей задачи и проверяем тишину.
+        for _ in range(10):
+            await asyncio.sleep(0.01)
+        assert not loop_exceptions
+    finally:
+        loop.set_exception_handler(original_handler)
+        await tunnel.aclose()
 
 
 def test_pack_batch_split_keeps_item_accounting_balanced():

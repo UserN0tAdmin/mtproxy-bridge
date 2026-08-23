@@ -402,11 +402,16 @@ class WebTunnel:
         """Гарантирует живую сессию; bootstrap выполняется в один заход.
 
         Single-flight: пока идёт установка сессии, все новые открыватели
-        присоединяются к одному in-flight bootstrap'у через shield —
-        отмена одного ожидающего (например, по дедлайну relay-слоя) не
-        убивает установку для остальных. Провал достаётся всем текущим
-        ожидающим сразу; первый вызывающий после провала начинает новую
-        попытку (туннель не «отравляется»).
+        присоединяются к одному in-flight bootstrap'у — отмена одного
+        ожидающего (например, по дедлайну relay-слоя) не убивает установку
+        для остальных. Провал достаётся всем текущим ожидающим сразу;
+        первый вызывающий после провала начинает новую попытку (туннель
+        не «отравляется»).
+
+        Ждём через ``asyncio.wait``, а не ``shield``: отменённый shield
+        вешает на задачу логгер исключений (в Python 3.14 это даёт шумный
+        ERROR с трейсбеком, когда bootstrap падает после разошедшихся
+        ожидающих), а ``wait`` про внутреннюю задачу ничего не считает.
         """
         if (
             self._carrier is not None
@@ -426,7 +431,13 @@ class WebTunnel:
                     t.exception()
 
             task.add_done_callback(_consume)
-        await asyncio.shield(task)
+        await asyncio.wait({task})
+        if task.cancelled():
+            # aclose() отменил общий bootstrap — завершаемся так же.
+            raise asyncio.CancelledError from None
+        exc = task.exception()
+        if exc is not None:
+            raise exc
 
     async def _bootstrap_session(self) -> None:
         """Полный цикл установки: страница → HELLO/WELCOME → carrier."""
