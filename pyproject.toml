@@ -47,3 +47,7 @@ mtproxy-bridge = "mtproxy_bridge.cli:main"
 
 [tool.hatch.build.targets.wheel]
 include = ["mtproxy_bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
