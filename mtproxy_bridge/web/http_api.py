@@ -232,7 +232,13 @@ class WebApi:
                     raise NetworkError(
                         f"{method} {path}: 503 persists beyond retry budget"
                     )
-                await asyncio.sleep(parse_retry_after(resp_headers.get("Retry-After")))
+                wait = parse_retry_after(resp_headers.get("Retry-After"))
+                if wait <= 0:
+                    # Референс: backoff=wait||(delay+jitter) — без Retry-After
+                    # пауза откатывается к обычному backoff, а не к горячему
+                    # циклу до исчерпания бюджета. Сам delay на 503 не растёт.
+                    wait = delay + random.uniform(0.0, max(delay / 4.0, 0.05))
+                await asyncio.sleep(wait)
                 continue
             return ApiResponse(status=status, headers=resp_headers, body=body)
 

@@ -90,13 +90,23 @@ def frame_bound(data: bytes, max_bytes: int) -> tuple[int, int]:
     return n_frames, offset
 
 
-def pack_batch(queue: deque[bytes], batch_limit: int) -> tuple[bytes, int, int]:
+def pack_batch(
+    queue: deque[bytes],
+    batch_limit: int,
+    *,
+    on_head_split: Callable[[], None] | None = None,
+) -> tuple[bytes, int, int]:
     """Собирает батч: целые элементы в пределах лимитов.
 
     Слишком крупная голова (несколько фреймов больше лимита) режется по
     границе фреймов; остаток остаётся первым элементом очереди. Одиночный
     фрейм крупнее лимита целиком — ошибка упаковки (наши DATA ≤ 64 КиБ,
     лимит ≥ 64 КиБ, так что это внутренний баг, а не транспортное событие).
+
+    ``on_head_split`` вызывается в момент разрезания головы: референсный
+    ``joinPending`` учитывает голову новым элементом очереди
+    (``queuedItems++``, остаток занимает старый слот). Без этого хука
+    баланс элементов после цикла enqueue/release уходит в минус.
 
     Returns:
         ``(тело, байты, число_элементов)`` — элементы уже сняты с очереди.
@@ -117,6 +127,8 @@ def pack_batch(queue: deque[bytes], batch_limit: int) -> tuple[bytes, int, int]:
                     f"frame of {len(payload)} bytes exceeds batch limit"
                 )
             queue[0] = payload[nb:]
+            if on_head_split is not None:
+                on_head_split()
             return head, nb, 1
         if count > 0 and (
             total + len(payload) > batch_limit or frames + fr > f.MAX_BATCH_FRAMES
@@ -289,11 +301,26 @@ class BaseCarrier:
         ):
             self._not_full.set()
 
+    def _charge_split_head(self, lane: "_LaneState | None" = None) -> None:
+        """Учитывает голову сплита новым элементом (как joinPending).
+
+        enqueue начислил один элемент за весь payload; после разрезания в
+        очереди живут голова-батч И остаток, поэтому при сплите элемент
+        добавляется, а ``release(count=1)`` позже списывает только голову.
+        """
+        self._queued_items += 1
+        if lane is not None:
+            lane.items += 1
+
     async def _drain_flat(self) -> tuple[bytes, int, int] | None:
         """Ждёт данные и снимает очередной батч плоской очереди."""
         while True:
             if self._pending:
-                return pack_batch(self._pending, self._batch_limit)
+                return pack_batch(
+                    self._pending,
+                    self._batch_limit,
+                    on_head_split=self._charge_split_head,
+                )
             if self._stopping:
                 return None
             self._not_empty.clear()
@@ -513,7 +540,11 @@ class LaneBasedCarrier(BaseCarrier):
     async def _pack_lane(self, lane: _LaneState) -> tuple[bytes, int, int] | None:
         while True:
             if lane.pending:
-                return pack_batch(lane.pending, self._batch_limit)
+                return pack_batch(
+                    lane.pending,
+                    self._batch_limit,
+                    on_head_split=lambda ln=lane: self._charge_split_head(ln),
+                )
             if lane.closed or self._stopping:
                 return None
             lane.wake.clear()

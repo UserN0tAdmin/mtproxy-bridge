@@ -218,7 +218,15 @@ class WebTunnel:
         return stream
 
     async def close_stream(self, stream_id: int) -> None:
-        """Закрывает поток: CLOSE наружу, локальный EOF читателям."""
+        """Закрывает поток: CLOSE наружу, локальный EOF читателям.
+
+        Лейн здесь НЕ забывается: немедленный ``forget_lane`` отменяет
+        sender/writer лейна до передачи CLOSE, и релей никогда не узнаёт о
+        закрытии (утечка стрима в https-lanes до конца сессии). Релей сам
+        подтверждает закрытие — ``X-Lane-Closed`` в lanes-режимах либо
+        закрытие сокета в websocket-lanes, — тогда carrier вызовет
+        ``forget_lane`` (см. ``_lane_poller``/``_lane_socket``).
+        """
         stream = self._streams.pop(stream_id, None)
         if stream is None:
             return
@@ -229,8 +237,6 @@ class WebTunnel:
                 await carrier.enqueue(
                     f.encode(f.FrameType.CLOSE, stream_id), lane_id=stream_id
                 )
-            with contextlib.suppress(Exception):
-                await carrier.forget_lane(stream_id)
 
     def close_stream_nowait(self, stream_id: int) -> None:
         """Планирует :meth:`close_stream` фоновой задачей."""

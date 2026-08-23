@@ -21,6 +21,7 @@ import asyncio
 import base64
 import hashlib
 import os
+import time
 from collections import deque
 
 import pytest
@@ -30,6 +31,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from mtproxy_bridge.links import parse_web_link
 from mtproxy_bridge.web import frames as f
 from mtproxy_bridge.web.bootstrap import fetch_bridge_page
+from mtproxy_bridge.web.carriers import pack_batch
 from mtproxy_bridge.web.http_api import BootstrapRejected, WebApi
 from mtproxy_bridge.web.tunnel import WebTunnel
 
@@ -591,3 +593,49 @@ async def test_wrong_capability_gets_decoy(relay):
     with pytest.raises(BootstrapRejected):
         await fetch_bridge_page(api, "A" * 43)
     await api.close()
+
+
+async def test_close_stream_delivers_close_to_relay(relay):
+    """Регрессия: forget_lane сразу после enqueue(CLOSE) отменял sender/writer
+    лейна до передачи CLOSE — релей не узнавал о закрытии и держал бэкенд
+    до конца сессии (утечка стримов в lanes-режимах)."""
+    tunnel = _make_tunnel(relay)
+    stream = await tunnel.open_stream()
+    await stream.write(b"bye")
+    assert await stream.read() == b"bye"
+    await tunnel.close_stream(stream.stream_id)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        # Релей вынимает writer при получении CLOSE (handle_up/_process_batch).
+        if stream.stream_id not in relay.session.writers:
+            break
+        await asyncio.sleep(0.01)
+    assert stream.stream_id not in relay.session.writers
+    # Ограничиваем уборку: против регрессии aclose не должен виснуть.
+    await asyncio.wait_for(tunnel.aclose(), timeout=15)
+
+
+def test_pack_batch_split_keeps_item_accounting_balanced():
+    """Сплит головы начисляет элемент, как joinPending референса:
+    цикл enqueue → pack/release обязан сходиться точно в ноль."""
+    payload = f.encode(f.FrameType.DATA, 1, b"x" * 100) + f.encode(
+        f.FrameType.WINDOW, 1, f.window_payload(5)
+    )
+    limit = 64  # DATA-фрейм кодируется в 108 байт → голова всегда режется
+    queue = deque([payload])
+    queued_bytes = len(payload)
+    queued_items = 1  # как после одного enqueue
+
+    while queue:
+
+        def on_split():
+            nonlocal queued_items
+            queued_items += 1
+
+        body, nbytes, count = pack_batch(queue, limit, on_head_split=on_split)
+        assert body
+        queued_bytes -= nbytes
+        queued_items -= count
+
+    assert queued_bytes == 0
+    assert queued_items == 0
