@@ -33,11 +33,22 @@ Kurigram v2.2.25+
 
 Также возможно с иными клиентами, кто поддерживает [TCP Padded Intermediate](https://core.telegram.org/mtproto/mtproto-transports#padded-intermediate)
 
-Python 3.9+, внешние зависимости — `cryptography` и `aiohttp`:
+Python 3.9+; базовая зависимость — `cryptography`. Пакет публикуется только на
+GitHub (не на PyPI), поэтому установка — по URL репозитория:
 
 ```bash
+# только classic MTProxy (tg://proxy)
 pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
+
+# + WEB Proxy (tg://webproxy): нужен extra [web] (aiohttp)
+pip install "mtproxy-bridge[web] @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git"
+
+# зафиксированная версия
+pip install "mtproxy-bridge[web] @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git@v0.3.0"
 ```
+
+Без extra `[web]` ссылки `tg://webproxy` не работают: CLI выведет подсказку
+переустановки с extra. Прямой режим (`tg://proxy`) работает всегда.
 
 Для обновления `--force-reinstall`
 

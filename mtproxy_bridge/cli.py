@@ -23,12 +23,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 from .config import BridgeConfig
 from .links import parse_tg_link, parse_web_link
 from .obfuscated2 import TAG_ABRIDGED, TAG_PADDED_INTERMEDIATE
 from .server import run_bridge
-from .web.tunnel import WebTunnel
+
+if TYPE_CHECKING:
+    from .web.tunnel import WebTunnel
 
 
 def main() -> None:
@@ -92,6 +95,17 @@ def main() -> None:
             use_block_e=True,
             web_link=web_link,
         )
+        # Ленивый импорт: WEB-режиму нужен extra [web] (aiohttp), direct-режим
+        # должен работать без него. TYPE_CHECKING-аннотация — в шапке модуля.
+        try:
+            from .web.tunnel import WebTunnel
+        except ImportError as exc:
+            raise SystemExit(
+                "WEB proxy mode requires the [web] extra, reinstall with:\n"
+                '    pip install "mtproxy-bridge[web] '
+                '@ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git"\n'
+                "(или та же команда без @…, когда пакет появится на PyPI)"
+            ) from exc
         tunnel = WebTunnel(web_link)
     else:
         link = parse_tg_link(args.tg_link)
