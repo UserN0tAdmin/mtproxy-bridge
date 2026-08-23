@@ -144,6 +144,7 @@ class _LaneState:
         "tasks",
         "socket",
         "socket_ready",
+        "poller_started",
     )
 
     def __init__(self, lane_id: int) -> None:
@@ -158,6 +159,10 @@ class _LaneState:
         self.tasks: list[asyncio.Task] = []
         self.socket: aiohttp.ClientWebSocketResponse | None = None
         self.socket_ready = asyncio.Event()
+        # Даунклинк-поллер лейна стартует только после первого успешного
+        # аплинка: сервер создаёт лейн по OPEN, и более ранний long poll
+        # получил бы 404 (как в референсном bridge).
+        self.poller_started = False
 
 
 class BaseCarrier:
@@ -526,16 +531,11 @@ class HttpsLanesCarrier(LaneBasedCarrier):
         await self.ensure_lane(0)  # control-lane (PONG/служебные фреймы)
 
     def _spawn_lane_transport(self, lane: _LaneState) -> None:
+        # Даунклинк-поллер добавит сам sender после первого ack (см. ниже).
         lane.tasks.append(
             asyncio.create_task(
                 self._guarded(f"lane {lane.lane_id} uplink",
                               lambda ln=lane: self._lane_sender(ln))
-            )
-        )
-        lane.tasks.append(
-            asyncio.create_task(
-                self._guarded(f"lane {lane.lane_id} downlink",
-                              lambda ln=lane: self._lane_poller(ln))
             )
         )
 
@@ -553,6 +553,16 @@ class HttpsLanesCarrier(LaneBasedCarrier):
             lane.items -= count
             self._release(nbytes, count)
             self._not_full.set()
+            if not lane.poller_started:
+                lane.poller_started = True
+                lane.tasks.append(
+                    asyncio.create_task(
+                        self._guarded(
+                            f"lane {lane.lane_id} downlink",
+                            lambda ln=lane: self._lane_poller(ln),
+                        )
+                    )
+                )
 
     async def _lane_poller(self, lane: _LaneState) -> None:
         while not lane.closed and not self._stopping:

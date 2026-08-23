@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mtproxy-bridge"
-version = "0.1.0"
-description = "MTProxy (MTProto proxy) SOCKS5 bridge for Kurigram and other clients that support padded intermediate and (optional) abridged transport"
+version = "0.2.0"
+description = "MTProto proxy SOCKS5 bridge for Kurigram and similar clients: classic MTProxy (FakeTLS/obfuscated2) and WEB Proxy (tg://webproxy) links"
 readme = "README.md"
 license = "LGPL-3.0-or-later"
 license-files = ["COPYING", "COPYING.LESSER"]
@@ -13,7 +13,7 @@ requires-python = ">=3.9"
 authors = [
     { name = "UserN0tAdmin" }
 ]
-keywords = ["mtproto", "telegram", "proxy", "socks5", "kurigram", "faketls", "mtproxy", "network", "mtproto-proxy"]
+keywords = ["mtproto", "telegram", "proxy", "socks5", "kurigram", "faketls", "mtproxy", "webproxy", "network", "mtproto-proxy"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",

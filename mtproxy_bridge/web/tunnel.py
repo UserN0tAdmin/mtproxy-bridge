@@ -202,6 +202,9 @@ class WebTunnel:
             self._streams[stream_id] = stream
         try:
             carrier = self._require_carrier()
+            # lanes-режимы: транспорт лейна (очередь/сокет) обязан существовать
+            # до первого фрейма; для плоских режимов это no-op.
+            await carrier.ensure_lane(stream_id)
             await carrier.enqueue(
                 f.encode(f.FrameType.OPEN, stream_id), lane_id=stream_id
             )
@@ -337,6 +340,12 @@ class WebTunnel:
             elif ftype is f.FrameType.CLOSE:
                 self._streams.pop(frame.stream_id, None)
                 stream._mark_eof()
+                # websocket-lanes: CLOSE завершает лейн — закрываем его сокет
+                # (для остальных режимов forget_lane — no-op).
+                carrier = self._carrier
+                if carrier is not None and carrier.failed is None:
+                    with contextlib.suppress(Exception):
+                        await carrier.forget_lane(frame.stream_id)
 
     async def _on_stream_reset(self, stream_id: int) -> None:
         """Падение установленного lane-сокета (websocket-lanes)."""

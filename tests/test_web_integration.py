@@ -8,12 +8,13 @@
 #  by the Free Software Foundation, either version 3 of the License, or
 #  (at your option) any later version.
 
-"""Интеграционный тест WEB-туннеля против mock-релея (режим https).
+"""Интеграционные тесты WEB-туннеля против mock-релея (все 4 carrier-режима).
 
-Mock-релей реализует минимальный контракт PROTOCOL.md v1: bridge-страница,
-сессия HELLO/WELCOME, сериализованные /up и long-poll /down; каждый
-логический поток подключается к локальному эхо-TCP-бэкенду — как настоящий
-tproxy-server к официальному MTProxy.
+Mock-релей реализует контракт PROTOCOL.md v1: bridge-страница, сессия
+HELLO/WELCOME, сериализованный https / lanes с X-Lane-ID и X-Lane-Closed,
+WebSocket- carriers с bearer в subprotocol. Бэкенд — локальный эхо-TCP;
+если задан ``mtproto_secret``, между релеем и бэкендом действует настоящий
+server-side obfuscated2 (как официальный MTProxy).
 """
 
 import asyncio
@@ -23,7 +24,7 @@ import os
 from collections import deque
 
 import pytest
-from aiohttp import web
+from aiohttp import WSMsgType, web
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from mtproxy_bridge.links import parse_web_link
@@ -36,31 +37,101 @@ HOST = "proxy.example.com"
 SECRET_HEX = "000102030405060708090a0b0c0d0e0f"
 
 _LONG_POLL_SECS = 3.0
+_WS_IDLE_PING_SECS = 5.0
+
+ALL_MODES = ["https", "https-lanes", "websocket", "websocket-lanes"]
 
 
 def _random_token() -> str:
     return base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
 
 
+class _Lane:
+    """Даунклинк-очередь одного лейна (+ признак закрытия потока)."""
+
+    def __init__(self, *, awaiting_open: bool = False) -> None:
+        self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self.dead = False  # CLOSE уже ушёл/пришёл — после осушения шлём X-Lane-Closed
+        # websocket-lanes: лейн появляется при коннекте сокета, а OPEN
+        # приходит первым сообщением уже поверх него.
+        self.awaiting_open = awaiting_open
+
+
 class _Session:
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, mode: str) -> None:
         self.token = token
-        self.down_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self.mode = mode
         self.backend_tasks: set[asyncio.Task] = set()
-        self.writers: dict[int, asyncio.StreamWriter] = {}
+        self.writers: dict[int, asyncio.StreamWriter] = {}  # stream -> backend
+        self.lanes: dict[int, _Lane] | None = None
+        self.down_queue: asyncio.Queue[bytes] | None = None
+        self.ws_tasks: set[asyncio.Task] = set()
+        if mode in ("https-lanes", "websocket-lanes"):
+            self.lanes = {0: _Lane()}  # lane 0 — session control
+        else:
+            self.down_queue = asyncio.Queue()
+
+    # Маршрутизация исходящих фреймов к carrier'у клиента.
+    def push(self, stream_id: int, payload: bytes) -> None:
+        if self.lanes is not None:
+            lane = self.lanes.get(stream_id)
+            if lane is None:
+                return  # поздний фрейм неизвестного/закрытого лейна
+            lane.queue.put_nowait(payload)
+        else:
+            assert self.down_queue is not None
+            self.down_queue.put_nowait(payload)
+
+    def mark_dead(self, stream_id: int) -> None:
+        if self.lanes is not None:
+            lane = self.lanes.get(stream_id)
+            if lane is not None:
+                lane.dead = True
+
+    def ensure_lane(self, stream_id: int) -> bool:
+        """OPEN обязан быть первым фреймом нового ненулевого лейна."""
+        if self.lanes is None:
+            return True
+        if stream_id == 0:
+            return False
+        lane = self.lanes.get(stream_id)
+        if lane is None:
+            self.lanes[stream_id] = _Lane()
+            return True
+        if lane.awaiting_open:
+            lane.awaiting_open = False
+            return True
+        return False
+
+    def teardown(self) -> None:
+        """Полная уборка: задачи pump'ов, бэкенд-сокеты, лейны."""
+        for task in self.ws_tasks:
+            task.cancel()
+        self.ws_tasks.clear()
+        for task in self.backend_tasks:
+            task.cancel()
+        self.backend_tasks.clear()
+        for writer in self.writers.values():
+            writer.close()
+        self.writers.clear()
+        if self.lanes is not None:
+            for lane in self.lanes.values():
+                lane.dead = True
 
 
 class MockRelay:
-    """Минимальный релей: bridge page + session/up/down, бэкенд-эхо.
+    """Минимальный релей: bridge page + session/up/down/ws, бэкенд-эхо."""
 
-    Если задан ``mtproto_secret`` (16 байт), бэкенд говорит по-настоящему
-    obfuscated2 (как официальный MTProxy): читает init клиента, выводит
-    серверные ключи и отвечает собственным init'ом — иначе это тупое эхо,
-    пригодное только для тестов без MTProto-трансформа.
-    """
-
-    def __init__(self, backend_port: int, mtproto_secret: bytes | None = None) -> None:
+    def __init__(
+        self,
+        backend_port: int,
+        carrier_mode: str = "https",
+        mtproto_secret: bytes | None = None,
+    ) -> None:
+        assert carrier_mode in ("https", "https-lanes", "websocket",
+                                "websocket-lanes")
         self.backend_port = backend_port
+        self.carrier_mode = carrier_mode
         self.mtproto_secret = mtproto_secret
         self.port: int | None = None
         self.capability: str | None = None
@@ -75,9 +146,11 @@ class MockRelay:
         app.router.add_post("/api/v1/up", self.handle_up)
         app.router.add_post("/api/v1/down", self.handle_down)
         app.router.add_delete("/api/v1/session", self.handle_delete)
+        app.router.add_get("/api/v1/ws", self.handle_ws)
         return app
 
     # ------------------------------------------------------------------
+    # HTTP endpoints
 
     async def handle_root(self, request: web.Request) -> web.Response:
         if request.query.get("bridge") != self.capability or len(request.query) != 1:
@@ -86,7 +159,7 @@ class MockRelay:
             "<!doctype html><script>"
             f'const relayOrigin="https://{HOST}",'
             f'bootstrap="{self.bootstrap_token}",'
-            'carrierMode="https";'
+            f'carrierMode="{self.carrier_mode}";'
             "</script><script>let batchLimit=2097152;</script>"
         )
         return web.Response(text=html, content_type="text/html")
@@ -103,12 +176,12 @@ class MockRelay:
         ):
             return web.Response(status=404)
         assert self.session is None, "mock supports one session per relay"
-        self.session = _Session(self.session_token)
+        self.session = _Session(self.session_token, self.carrier_mode)
         return web.Response(
             status=200,
             headers={
                 "X-Session-Token": self.session_token,
-                "X-Carrier-Mode": "https",
+                "X-Carrier-Mode": self.carrier_mode,
                 "X-Down-Cursor": "0",
             },
             body=f.encode(f.FrameType.WELCOME, 0),
@@ -123,8 +196,10 @@ class MockRelay:
         for frame in f.parse_batch(await request.read()):
             stream_id = frame.stream_id
             if stream_id == 0:
-                continue  # WINDOW/PONG на нулевом потоке игнорируем
+                continue  # PONG/WINDOW-control на нулевом потоке игнорируем
             if frame.type is f.FrameType.OPEN:
+                if not session.ensure_lane(stream_id):
+                    return web.Response(status=404)
                 # Подключаемся синхронно относительно батча, чтобы DATA из
                 # того же тела гарантированно нашёл writer.
                 reader, writer = await asyncio.open_connection(
@@ -146,17 +221,19 @@ class MockRelay:
                 # Как настоящий релей: WINDOW-кредит возвращаем только после
                 # фактической записи байт в бэкенд-сокет (backendDrained).
                 await writer.drain()
-                await session.down_queue.put(
+                session.push(
+                    stream_id,
                     f.encode(
                         f.FrameType.WINDOW,
                         stream_id,
                         f.window_payload(len(frame.payload)),
-                    )
+                    ),
                 )
             elif frame.type is f.FrameType.CLOSE:
                 writer = session.writers.pop(stream_id, None)
                 if writer is not None:
                     writer.close()
+                session.mark_dead(stream_id)
         return web.Response(status=204, headers={"X-Up-Ack": seq})
 
     async def handle_down(self, request: web.Request) -> web.Response:
@@ -165,29 +242,171 @@ class MockRelay:
         session = self.session
         if auth != f"Bearer {self.session_token}" or session is None:
             return web.Response(status=404)
-        queue = session.down_queue
+
+        lane: _Lane | None = None
+        if session.lanes is not None:
+            raw_lane = request.headers.get("X-Lane-ID", "")
+            try:
+                lane_id = int(raw_lane)
+            except ValueError:
+                return web.Response(status=404)
+            lane = session.lanes.get(lane_id)
+            if lane is None:
+                return web.Response(status=404)
+            queue = lane.queue
+        else:
+            queue = session.down_queue
+
+        headers = {"X-Down-Cursor": cursor}
         try:
             first = await asyncio.wait_for(queue.get(), timeout=_LONG_POLL_SECS)
         except asyncio.TimeoutError:
-            return web.Response(
-                status=204, headers={"X-Down-Cursor": cursor}
-            )
+            if lane is not None and lane.dead:
+                headers["X-Lane-Closed"] = "1"
+            return web.Response(status=204, headers=headers)
+
         chunks = deque([first])
         while not queue.empty():
             chunks.append(queue.get_nowait())
+        body = b"".join(chunks)
         return web.Response(
             status=200,
             headers={
                 "X-Down-Cursor": str(int(cursor) + 1),
                 "Content-Type": "application/octet-stream",
             },
-            body=b"".join(chunks),
+            body=body,
         )
 
     async def handle_delete(self, request: web.Request) -> web.Response:
         if request.headers.get("Authorization") != f"Bearer {self.session_token}":
             return web.Response(status=404)
+        if self.session is not None:
+            self.session.teardown()
         return web.Response(status=204)
+
+    # ------------------------------------------------------------------
+    # WebSocket carriers
+
+    async def handle_ws(self, request: web.Request) -> web.StreamResponse:
+        session = self.session
+        if (
+            request.method != "GET"
+            or request.headers.get("Authorization")
+            or session is None
+        ):
+            return web.Response(status=404)
+        offered = request.headers.get("Sec-WebSocket-Protocol", "")
+        sub = offered.split(",")[0].strip()
+
+        lane: _Lane | None = None
+        lane_id: int | None = None
+        if self.carrier_mode == "websocket":
+            expected = f"tproxy-v1.{self.session_token}"
+            if sub != expected:
+                return web.Response(status=404)
+            queue = session.down_queue
+        elif self.carrier_mode == "websocket-lanes":
+            prefix = f"tproxy-lane-v1.{self.session_token}."
+            if not sub.startswith(prefix):
+                return web.Response(status=404)
+            try:
+                lane_id = int(sub[len(prefix):])
+            except ValueError:
+                return web.Response(status=404)
+            # lane 0 не существует, повторное использование id запрещено.
+            if lane_id == 0 or lane_id in session.lanes:
+                return web.Response(status=404)
+            lane = _Lane(awaiting_open=True)
+            session.lanes[lane_id] = lane
+            queue = lane.queue
+        else:
+            return web.Response(status=404)
+
+        ws = web.WebSocketResponse(protocols=(sub,), autoping=True)
+        await ws.prepare(request)
+
+        async def pump() -> None:
+            while True:
+                try:
+                    first = await asyncio.wait_for(
+                        queue.get(), timeout=_WS_IDLE_PING_SECS
+                    )
+                except asyncio.TimeoutError:
+                    await ws.ping()
+                    continue
+                items = [first]
+                while not queue.empty():
+                    items.append(queue.get_nowait())
+                await ws.send_bytes(b"".join(items))
+
+        pump_task = asyncio.create_task(pump())
+        session.ws_tasks.add(pump_task)
+        try:
+            async for msg in ws:
+                if msg.type != WSMsgType.BINARY:
+                    break
+                if msg.data:
+                    ok = await self._process_batch(session, msg.data)
+                    if not ok:
+                        break
+        finally:
+            pump_task.cancel()
+            session.ws_tasks.discard(pump_task)
+            if lane_id is not None and session.lanes.get(lane_id) is lane:
+                del session.lanes[lane_id]
+                lane.dead = True
+                writer = session.writers.pop(lane_id, None)
+                if writer is not None:
+                    writer.close()
+        return ws
+
+    async def _process_batch(self, session: _Session, batch: bytes) -> bool:
+        """Общая обработка аплинк-батча для HTTP /up и WebSocket.
+
+        Возвращает False при нарушении протокола (сокет закрывается).
+        """
+        for frame in f.parse_batch(batch):
+            stream_id = frame.stream_id
+            if stream_id == 0:
+                continue
+            if frame.type is f.FrameType.OPEN:
+                if not session.ensure_lane(stream_id):
+                    return False
+                reader, writer = await asyncio.open_connection(
+                    "127.0.0.1", self.backend_port
+                )
+                session.writers[stream_id] = writer
+                if self.mtproto_secret is not None:
+                    coro = self._pipe_obf(
+                        session, stream_id, reader, writer, self.mtproto_secret
+                    )
+                else:
+                    coro = self._pipe(session, stream_id, reader, writer)
+                task = asyncio.create_task(coro)
+                session.backend_tasks.add(task)
+                task.add_done_callback(session.backend_tasks.discard)
+            elif frame.type is f.FrameType.DATA:
+                writer = session.writers[stream_id]
+                writer.write(frame.payload)
+                await writer.drain()
+                session.push(
+                    stream_id,
+                    f.encode(
+                        f.FrameType.WINDOW,
+                        stream_id,
+                        f.window_payload(len(frame.payload)),
+                    ),
+                )
+            elif frame.type is f.FrameType.CLOSE:
+                writer = session.writers.pop(stream_id, None)
+                if writer is not None:
+                    writer.close()
+                session.mark_dead(stream_id)
+        return True
+
+    # ------------------------------------------------------------------
+    # Бэкенд: по потоку — TCP-соединение с эхо-сервером
 
     @staticmethod
     def _ctr(key: bytes, iv: bytes):
@@ -231,17 +450,19 @@ class MockRelay:
                 if not data:
                     break
                 plain = srv_decryptor.update(data)
-                await session.down_queue.put(
+                session.push(
+                    stream_id,
                     f.encode(
                         f.FrameType.DATA,
                         stream_id,
                         srv_encryptor.update(plain),
-                    )
+                    ),
                 )
         finally:
             session.writers.pop(stream_id, None)
             writer.close()
-            await session.down_queue.put(f.encode(f.FrameType.CLOSE, stream_id))
+            session.push(stream_id, f.encode(f.FrameType.CLOSE, stream_id))
+            session.mark_dead(stream_id)
 
     async def _pipe(
         self,
@@ -256,13 +477,15 @@ class MockRelay:
                 data = await reader.read(262144)
                 if not data:
                     break
-                await session.down_queue.put(
-                    f.encode(f.FrameType.DATA, stream_id, data)
+                session.push(
+                    stream_id,
+                    f.encode(f.FrameType.DATA, stream_id, data),
                 )
         finally:
             session.writers.pop(stream_id, None)
             writer.close()
-            await session.down_queue.put(f.encode(f.FrameType.CLOSE, stream_id))
+            session.push(stream_id, f.encode(f.FrameType.CLOSE, stream_id))
+            session.mark_dead(stream_id)
 
 
 @pytest.fixture
@@ -287,12 +510,9 @@ async def echo_server():
     await server.wait_closed()
 
 
-@pytest.fixture
-async def relay(echo_server):
-    mock = MockRelay(echo_server)
-    # shutdown_timeout маленький: после отмены long-poll'ов у клиента остаются
-    # полуоткрытые keep-alive соединения, и дефолтные 60 с ожидания релея
-    # превращаются в «зависший» teardown.
+@pytest.fixture(params=ALL_MODES)
+async def relay(request, echo_server):
+    mock = MockRelay(echo_server, carrier_mode=request.param)
     runner = web.AppRunner(mock.make_app(), shutdown_timeout=2)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -310,7 +530,9 @@ def _make_tunnel(relay: MockRelay) -> WebTunnel:
 
 async def test_roundtrip_small(relay):
     tunnel = _make_tunnel(relay)
+    assert tunnel.carrier_mode == ""  # ещё не установлена
     stream = await tunnel.open_stream()
+    assert tunnel.carrier_mode == relay.carrier_mode
     await stream.write(b"ping")
     assert await stream.read() == b"ping"
     await tunnel.close_stream(stream.stream_id)
@@ -358,7 +580,7 @@ async def test_close_propagates_eof(relay):
     stream = await tunnel.open_stream()
     await stream.write(b"bye-test")
     assert await stream.read() == b"bye-test"
-    stream.close()
+    await tunnel.close_stream(stream.stream_id)
     # Бэкенд закрылся → релей прислал CLOSE → read() вернёт b"".
     assert await asyncio.wait_for(stream.read(), timeout=15) == b""
     await tunnel.aclose()
