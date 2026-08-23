@@ -41,21 +41,27 @@ __version__ = "0.1.0"
 from .config import BridgeConfig
 from .links import (
     ProxyLink,
+    WebProxyLink,
     is_mtproto_link,
+    is_web_proxy_link,
     needs_padded_transport,
     parse_secret,
     parse_tg_link,
+    parse_web_link,
 )
 from .server import start_local_bridge, stop_all_bridges
 
 __all__ = [
     "BridgeConfig",
     "ProxyLink",
+    "WebProxyLink",
     "__version__",
     "is_mtproto_link",
+    "is_web_proxy_link",
     "needs_padded_transport",
     "parse_secret",
     "parse_tg_link",
+    "parse_web_link",
     "start_local_bridge",
     "stop_all_bridges",
 ]
