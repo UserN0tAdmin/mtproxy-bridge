@@ -124,6 +124,9 @@ class CheckResult:
     dc_id: int
     transport: str  # "abridged" | "padded intermediate"
     stages: tuple[StageResult, ...]
+    # Carrier mode chosen by the relay ("https" | "websocket-lanes" | ...);
+    # populated in WEB mode only, None for direct links / failed sessions.
+    carrier: str | None = None
 
     def to_dict(self) -> dict:
         """Flat JSON-compatible structure of the result."""
@@ -137,6 +140,7 @@ class CheckResult:
             "total_ms": self.total_ms,
             "dc_id": self.dc_id,
             "transport": self.transport,
+            "carrier": self.carrier,
             "stages": [dataclasses.asdict(s) for s in self.stages],
         }
 
@@ -159,6 +163,7 @@ class _Collector:
         self._stages: list[StageResult] = []
         self.mtproto_error: int | None = None
         self.rtt_ms: float | None = None
+        self.carrier: str | None = None
         self._t0 = time.monotonic()
 
     @property
@@ -185,6 +190,7 @@ class _Collector:
             dc_id=self._dc_id,
             transport=self._transport,
             stages=tuple(self._stages),
+            carrier=self.carrier,
         )
 
 
@@ -537,6 +543,7 @@ async def _run_web(
             f"bootstrap+stream {stream.stream_id}, carrier={tunnel.carrier_mode}",
         ):
             return
+        collector.carrier = tunnel.carrier_mode or None
 
         expected_tag = TAG_PADDED_INTERMEDIATE if link.is_padded else TAG_ABRIDGED
         keys = build_obfuscated2_header(expected_tag, dc_id, link.secret_key)

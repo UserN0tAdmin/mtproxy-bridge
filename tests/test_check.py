@@ -104,7 +104,7 @@ def test_check_result_serialization():
     d = result.to_dict()
     assert set(d) == {
         "ok", "mode", "stage", "error", "mtproto_error", "rtt_ms",
-        "total_ms", "dc_id", "transport", "stages",
+        "total_ms", "dc_id", "transport", "carrier", "stages",
     }
     assert '"ok": false' in result.to_json(indent=2)
 
@@ -264,6 +264,7 @@ async def test_check_direct_ok(fake_mtproxy):
     assert result.rtt_ms is not None and result.rtt_ms >= 0
     assert result.mtproto_error is None
     assert result.transport == "abridged"
+    assert result.carrier is None
     assert result.to_dict()["ok"] is True
 
 
@@ -279,3 +280,4 @@ async def test_check_web_ok(web_relay):
     assert [s.name for s in result.stages] == ["parse", "session", "ping"]
     assert result.mode == "web"
     assert result.transport == "padded intermediate"
+    assert result.carrier == "https"  # MockRelay default

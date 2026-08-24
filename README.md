@@ -146,6 +146,8 @@ result = await check_link(MTPROXY, timeout=15.0)   # из корутины
 
 if result.ok:
     print(f"живой, ping {result.rtt_ms:.0f} мс")
+    if result.carrier:                              # только WEB-режим
+        print(f"carrier: {result.carrier}")
 else:
     print(f"мертв на стадии {result.stage}: {result.error}")
     if result.mtproto_error:                        # например -404
