@@ -38,6 +38,7 @@ from __future__ import annotations
 
 __version__ = "0.3.0"
 
+from .check import CheckResult, StageResult, check_link, check_link_sync
 from .config import BridgeConfig
 from .links import (
     ProxyLink,
@@ -53,9 +54,13 @@ from .server import start_local_bridge, stop_all_bridges
 
 __all__ = [
     "BridgeConfig",
+    "CheckResult",
     "ProxyLink",
+    "StageResult",
     "WebProxyLink",
     "__version__",
+    "check_link",
+    "check_link_sync",
     "is_mtproto_link",
     "is_web_proxy_link",
     "needs_padded_transport",

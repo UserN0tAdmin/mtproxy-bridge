@@ -134,6 +134,48 @@ The bridge derives the bridge-capability (HMAC-SHA256 over hostname+secret), fet
 
 For non-standard deployments and tests, `start_local_bridge` accepts `web_origin=` to override the default `https://<host>` origin.
 
+### Checking a proxy (check)
+
+The library function performs a full MTProto ping: a real `req_pq_multi` is sent through the tunnel and the `resPQ` reply is verified together with the nonce echo — the only way to prove the secret is correct and the proxy actually relays to a Telegram DC. The function never raises for "proxy is dead" outcomes; every result is described in the returned object:
+
+```python
+from mtproxy_bridge import check_link, check_link_sync
+
+result = await check_link(MTPROXY, timeout=15.0)   # from a coroutine
+# result = check_link_sync(MTPROXY)                # from sync code
+
+if result.ok:
+    print(f"alive, ping {result.rtt_ms:.0f} ms")
+else:
+    print(f"dead at stage {result.stage}: {result.error}")
+    if result.mtproto_error:                        # e.g. -404
+        ...
+print(result.to_json(indent=2))                     # machine-readable form
+```
+
+The same via the CLI (exit code 0 = alive, 1 = dead):
+
+```bash
+mtproxy-bridge check "tg://proxy?server=1.2.3.4&port=443&secret=ee0102..."
+mtproxy-bridge check "tg://webproxy?server=proxy.example.com&secret=dd..." --json
+```
+
+```
+[1/3] Link               OK   0 ms — tg://proxy, transport: abridged
+[2/3] TCP connect        OK   84 ms — 1.2.3.4:443
+[3/3] MTProto ping       OK   158 ms — resPQ, nonce matched
+
+Proxy works (total 243 ms, ping 158 ms)
+```
+
+| Parameter     | Default       | Description |
+|---------------|---------------|-------------|
+| `tg_link`     | — (required)  | `tg://proxy` or `tg://webproxy` link |
+| `--timeout`   | `15`          | total budget for all stages, seconds |
+| `--dc-id`     | `2`           | data center ID for the obfuscated2 header |
+| `--json`      | off           | JSON result to stdout (for scripts/monitoring) |
+| `--debug`     | off           | DEBUG logging |
+
 ## Using it via the CLI
 
 Not the primary way to use it. Example:

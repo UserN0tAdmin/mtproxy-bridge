@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from typing import TYPE_CHECKING
 
 from .config import BridgeConfig
@@ -34,8 +35,103 @@ if TYPE_CHECKING:
     from .web.tunnel import WebTunnel
 
 
+# ============================================================================
+# Подкоманда check (mtproxy-bridge check "<link>")
+# ============================================================================
+
+# Человекочитаемые подписи стадий для текстового вывода (публичный вывод —
+# на английском; см. также HANDOFF §4.13 про язык комментариев).
+_STAGE_LABELS = {
+    "parse": "Link",
+    "connect": "TCP connect",
+    "handshake": "FakeTLS handshake",
+    "session": "Web session",
+    "ping": "MTProto ping",
+}
+
+
+def _render_check_text(result) -> None:
+    """Поэтапный человекочитаемый вывод результата проверки."""
+    total = len(result.stages)
+    for i, st in enumerate(result.stages, 1):
+        label = _STAGE_LABELS.get(st.name, st.name)
+        status = "OK  " if st.ok else "FAIL"
+        line = f"[{i}/{total}] {label:<18} {status}"
+        if st.ms is not None:
+            line += f" {st.ms:.0f} ms"
+        if st.detail:
+            line += f" — {st.detail}"
+        print(line)
+    if result.ok:
+        rtt = f", ping {result.rtt_ms:.0f} ms" if result.rtt_ms is not None else ""
+        print(f"\nProxy works (total {result.total_ms:.0f} ms{rtt})")
+    else:
+        error = f": {result.error}" if result.error else ""
+        label = _STAGE_LABELS.get(result.stage, result.stage)
+        print(f"\nProxy is NOT working — stage \"{label}\"{error}")
+
+
+def _main_check(argv: list[str]) -> None:
+    """Точка входа подкоманды check: тонкая обёртка над check_link()."""
+    from .check import check_link
+
+    parser = argparse.ArgumentParser(
+        prog="mtproxy-bridge check",
+        description="Check whether an MTProto/WEB proxy link is alive "
+        "(full MTProto ping req_pq_multi → resPQ against a Telegram DC)",
+    )
+    parser.add_argument(
+        "tg_link",
+        help="tg://proxy?server=...&port=...&secret=... or "
+        "tg://webproxy?server=...&secret=...",
+    )
+    parser.add_argument("--timeout", type=float, default=15.0,
+                        help="total budget for all stages, seconds (default 15)")
+    parser.add_argument("--dc-id", type=int, default=2,
+                        help="data center ID for the obfuscated2 header (default 2)")
+    parser.add_argument("--json", action="store_true",
+                        help="machine-readable JSON output to stdout")
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Enable DEBUG logging")
+    parser.add_argument("--no-ccs", action="store_true", default=False,
+                        help="Do not send CCS before the first AppData record "
+                        "(direct FakeTLS mode only)")
+    parser.add_argument("--no-block-m", action="store_true", default=False,
+                        help="Disable block M in ClientHello (direct FakeTLS mode only)")
+    parser.add_argument("--no-block-e", action="store_true", default=False,
+                        help="Disable block E in ClientHello (direct FakeTLS mode only)")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.WARNING,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    result = asyncio.run(check_link(
+        args.tg_link,
+        timeout=args.timeout,
+        dc_id=args.dc_id,
+        send_ccs=not args.no_ccs,
+        use_block_m=not args.no_block_m,
+        use_block_e=not args.no_block_e,
+    ))
+
+    if args.json:
+        print(result.to_json(indent=2))
+    else:
+        _render_check_text(result)
+    sys.exit(0 if result.ok else 1)
+
+
 def main() -> None:
     """CLI entry point: parse arguments and start a blocking bridge."""
+    # Диспетчер подкоманд: 'check' → отдельный парсер; иначе legacy-режим
+    # (первый позиционный аргумент — сама ссылка), обратная совместимость.
+    argv = sys.argv[1:]
+    if argv and argv[0] == "check":
+        _main_check(argv[1:])
+        return
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "tg_link",

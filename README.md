@@ -134,6 +134,48 @@ MTPROXY = "tg://webproxy?server=proxy.example.com&secret=dd0123456789abcdef01234
 
 Для нестандартных деплоев и тестов у `start_local_bridge` есть параметр `web_origin=` — переопределить `https://<host>` на произвольный origin.
 
+### Проверка прокси (check)
+
+Библиечная функция выполняет полный MTProto-ping: через туннель отправляется настоящий `req_pq_multi`, в ответе сверяется `resPQ` и эхо nonce — единственный способ доказать, что секрет верен и прокси реально релеит до Telegram DC. Функция не бросает исключений по факту «прокси мёртв» — любой исход описан в результате:
+
+```python
+from mtproxy_bridge import check_link, check_link_sync
+
+result = await check_link(MTPROXY, timeout=15.0)   # из корутины
+# result = check_link_sync(MTPROXY)                # из синхронного кода
+
+if result.ok:
+    print(f"живой, ping {result.rtt_ms:.0f} мс")
+else:
+    print(f"мертв на стадии {result.stage}: {result.error}")
+    if result.mtproto_error:                        # например -404
+        ...
+print(result.to_json(indent=2))                     # машиночитаемый вид
+```
+
+То же через CLI (exit-код 0 = живой, 1 = нет):
+
+```bash
+mtproxy-bridge check "tg://proxy?server=1.2.3.4&port=443&secret=ee0102..."
+mtproxy-bridge check "tg://webproxy?server=proxy.example.com&secret=dd..." --json
+```
+
+```
+[1/3] Link               OK   0 ms — tg://proxy, transport: abridged
+[2/3] TCP connect        OK   84 ms — 1.2.3.4:443
+[3/3] MTProto ping       OK   158 ms — resPQ, nonce matched
+
+Proxy works (total 243 ms, ping 158 ms)
+```
+
+| Параметр      | По умолчанию | Описание |
+|---------------|--------------|----------|
+| `tg_link`     | — (обязателен) | ссылка `tg://proxy` или `tg://webproxy` |
+| `--timeout`   | `15`         | общий бюджет всех стадий, секунды |
+| `--dc-id`     | `2`          | ID дата-центра для obfuscated2-заголовка |
+| `--json`      | выкл.        | JSON результата в stdout (для скриптов/мониторинга) |
+| `--debug`     | выкл.        | DEBUG-логирование |
+
 ## Использование через CLI
 
 Не основной способ использования. Пример:
