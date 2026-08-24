@@ -44,7 +44,7 @@ pip install git+https://github.com/UserN0tAdmin/mtproxy-bridge.git
 pip install "mtproxy-bridge[web] @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git"
 
 # зафиксированная версия
-pip install "mtproxy-bridge[web] @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git@v0.3.2"
+pip install "mtproxy-bridge[web] @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git@v0.3.3"
 ```
 
 Без extra `[web]` ссылки `tg://webproxy` не работают: CLI выведет подсказку

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mtproxy-bridge"
-version = "0.3.2"
+version = "0.3.3"
 description = "MTProto proxy SOCKS5 bridge for Kurigram and similar clients: classic MTProxy (FakeTLS/obfuscated2) and WEB Proxy (tg://webproxy) links"
 readme = "README.md"
 license = "LGPL-3.0-or-later"
