@@ -98,27 +98,27 @@ class _PingOK(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class StageResult:
-    """Итог одной стадии проверки."""
+    """Outcome of a single check stage."""
 
-    name: str  # parse|connect|handshake|session|ping
+    name: str  # stage id: parse|connect|handshake|session|ping
     ok: bool
     ms: float | None
-    detail: str = ""
+    detail: str = ""  # human-readable detail
 
 
 @dataclasses.dataclass(frozen=True)
 class CheckResult:
-    """Структурированный итог :func:`check_link`.
+    """Structured result of :func:`check_link`.
 
-    Поля безопасны для сериализации: :meth:`to_dict` / :meth:`to_json`
-    используются CLI (--json) и внешними интеграциями напрямую.
+    All fields are serialization-safe: :meth:`to_dict` / :meth:`to_json`
+    feed the CLI (--json) and can be consumed by integrations directly.
     """
 
     ok: bool
     mode: str  # "direct" | "web"
-    stage: str  # последняя достигнутая стадия
-    error: str | None  # причина отказа (None при ok=True)
-    mtproto_error: int | None  # числовой код ошибки DC (-404 и т.п.)
+    stage: str  # last stage reached
+    error: str | None  # failure reason (None when ok=True)
+    mtproto_error: int | None  # numeric DC error code (-404 etc.)
     rtt_ms: float | None  # req_pq_multi → resPQ
     total_ms: float
     dc_id: int
@@ -126,7 +126,7 @@ class CheckResult:
     stages: tuple[StageResult, ...]
 
     def to_dict(self) -> dict:
-        """Плоская JSON-совместимая структура результата."""
+        """Flat JSON-compatible structure of the result."""
         return {
             "ok": self.ok,
             "mode": self.mode,
@@ -141,7 +141,7 @@ class CheckResult:
         }
 
     def to_json(self, *, indent: int | None = None) -> str:
-        """Сериализация результата в JSON-строку."""
+        """Serialize the result to a JSON string."""
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
 
 
@@ -586,26 +586,26 @@ async def check_link(
     use_block_e: bool = True,
     web_origin: str | None = None,
 ) -> CheckResult:
-    """Полная проверка прокси-ссылки: ``req_pq_multi`` → ``resPQ`` до DC.
+    """Fully check a proxy link: ``req_pq_multi`` → ``resPQ`` roundtrip to a DC.
 
-    Не бросает исключений по факту «прокси недоступен/секрет неверен» —
-    любой исход описывается в :class:`CheckResult` (включая стадию
-    ``parse`` для невалидной ссылки). Исключения возможны только при
-    программных ошибках вызова (неверный тип аргументов).
+    Never raises for "proxy unreachable / wrong secret" outcomes — every
+    result is described in :class:`CheckResult` (including the ``parse``
+    stage for an invalid link). Exceptions are only possible on programming
+    errors (wrong argument types).
 
     Args:
-        link: ``tg://proxy?...`` / ``tg://webproxy?...`` ссылка.
-        timeout: общий бюджет всех стадий, секунды.
-        dc_id: ID дата-центра для заголовка obfuscated2 (по умолчанию 2;
-            в check-режиме нет SOCKS5-target, поэтому автоопределение из
-            :mod:`mtproxy_bridge.dc` неприменимо).
-        send_ccs: CCS перед первой AppData записью (direct FakeTLS).
-        use_block_m: блок M (Kyber-like) в ClientHello (direct FakeTLS).
-        use_block_e: блок E в ClientHello (direct FakeTLS).
-        web_origin: override origin WEB-релея (тесты/нестандартные деплои).
+        link: ``tg://proxy?...`` / ``tg://webproxy?...`` link.
+        timeout: total budget for all stages, seconds.
+        dc_id: Data center ID for the obfuscated2 header (default 2;
+            check mode has no SOCKS5 target host, so auto-detection from
+            :mod:`mtproxy_bridge.dc` does not apply here).
+        send_ccs: Send CCS before the first AppData record (direct FakeTLS).
+        use_block_m: Block M (Kyber-like) in ClientHello (direct FakeTLS).
+        use_block_e: Block E in ClientHello (direct FakeTLS).
+        web_origin: Override the WEB relay origin (tests/non-standard deploys).
 
     Returns:
-        :class:`CheckResult` со стадиями, таймингами и причиной отказа.
+        :class:`CheckResult` with stages, timings and failure reason.
     """
     started = time.monotonic()
     is_web = link.strip().lower().startswith(
@@ -673,9 +673,9 @@ async def check_link(
 
 
 def check_link_sync(link: str, **kwargs) -> CheckResult:
-    """Синхронная обёртка над :func:`check_link` (asyncio.run).
+    """Synchronous wrapper around :func:`check_link` (uses asyncio.run).
 
-    НЕ вызывать из уже запущенного event loop / корутины — используйте
-    там ``await check_link(...)``. Остальные параметры см. в её докстринге.
+    Do NOT call it from an already running event loop / coroutine — use
+    ``await check_link(...)`` there. See its docstring for the parameters.
     """
     return asyncio.run(check_link(link, **kwargs))

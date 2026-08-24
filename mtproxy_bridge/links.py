@@ -251,11 +251,12 @@ def _decode_web_secret(secret_str: str) -> tuple[bytes, bytes]:
 def parse_web_link(link: str) -> WebProxyLink:
     """Parse ``tg://webproxy?server=...&secret=...`` into a :class:`WebProxyLink`.
 
-    Порт в ссылке отсутствует (или равен 443); HTTPS фиксирован типом прокси.
+    The port is absent from the link (or equals 443); HTTPS is fixed by
+    the WEB proxy type.
 
     Raises:
-        ValueError: server/secret отсутствуют, порт ≠ 443, невалидный
-            hostname или секрет неподдерживаемого формата.
+        ValueError: server/secret missing, port != 443, invalid hostname,
+            or unsupported secret format.
     """
     parsed = urlparse(link.strip())
     params = parse_qs(parsed.query)
