@@ -44,6 +44,7 @@ import secrets
 import struct
 import time
 from collections.abc import Awaitable, Callable
+from typing import NamedTuple
 
 from .config import UPSTREAM_CONNECT_TIMEOUT_SECS
 from .faketls import async_faketls_handshake
@@ -289,36 +290,60 @@ def build_req_pq_multi(nonce: bytes) -> bytes:
     )
 
 
-def parse_response(message: bytes, nonce: bytes) -> tuple[int | None, str]:
+class _ResponseVerdict(NamedTuple):
+    """Итог разбора одного сообщения-ответа DC (см. :func:`parse_response`)."""
+
+    ok: bool                   # True только для resPQ с эхом нашего nonce
+    mtproto_error: int | None  # числовой код ошибки DC (-404 и т.п.)
+    retry: bool                # nop/quick-ack: «ещё не ответ», читать дальше
+    detail: str
+
+
+def parse_response(message: bytes, nonce: bytes) -> _ResponseVerdict:
     """Разбирает расшифрованное сообщение-ответ DC.
 
     Семантика Transport::read + PingConnectionReqPQ.on_raw_packet (TDLib):
         - короткий (<16 байт) пакет — числовой код ошибки MTProto;
+          код 0 — nop и -1 с seq — quick-ack («не ответ», читаем дальше);
         - auth_key_id != 0 → ответ не похож на MTProto (мусор/эхо);
         - иначе plain-пакет: msg_id | size | body; тело может быть
           обёрнуто в rpc_result (обрабатываем на всякий случай).
 
-    Returns:
-        ``(mtproto_error, detail)``: код ошибки DC (если это ошибка) и
-        человекочитаемый итог. Успех: ``(None, "resPQ, nonce совпал")``.
+    Успех ровно один: resPQ с эхом nonce. Любой иной исход — провал пинга;
+    ``retry=True`` означает лишь «настоящего ответа ещё не было».
+    ``mtproto_error is None`` НЕ означает успех.
     """
     if len(message) < 16:
         if len(message) >= 4:
             code = struct.unpack_from("<i", message, 0)[0]
             if code == 0:
-                return None, "empty packet from server"
+                return _ResponseVerdict(
+                    False, None, True, "empty packet from server (nop)"
+                )
+            if code == -1 and len(message) >= 8:
+                # Transport::read: quick-ack (seq в следующих 4 байтах).
+                return _ResponseVerdict(False, None, True, "quick-ack received")
             hint = (
                 "usually a wrong secret or transport tag"
                 if code == -404
                 else "DC error"
             )
-            return code, f"MTProto error {code} ({hint})"
-        return None, f"response too short ({len(message)} bytes)"
+            return _ResponseVerdict(
+                False, code, False, f"MTProto error {code} ({hint})"
+            )
+        return _ResponseVerdict(
+            False, None, False, f"response too short ({len(message)} bytes)"
+        )
 
     if struct.unpack_from("<Q", message, 0)[0] != 0:
-        return None, "auth_key_id != 0 — response does not look like MTProto"
+        return _ResponseVerdict(
+            False,
+            None,
+            False,
+            "auth_key_id != 0 — response does not look like MTProto",
+        )
     if len(message) < 20:
-        return None, "truncated plain packet"
+        return _ResponseVerdict(False, None, False, "truncated plain packet")
 
     inner_size = struct.unpack_from("<i", message, 16)[0]
     body = memoryview(message)[20 : 20 + max(inner_size, 0)]
@@ -330,14 +355,26 @@ def parse_response(message: bytes, nonce: bytes) -> tuple[int | None, str]:
         len(body) >= 12
         and struct.unpack_from("<I", body, 0)[0] == _BAD_MSG_NOTIFICATION_ID
     ):
-        return None, "bad_msg_notification received from server"
+        return _ResponseVerdict(
+            False,
+            None,
+            False,
+            "bad_msg_notification received from server (not resPQ)",
+        )
 
     if len(body) < 20 or struct.unpack_from("<I", body, 0)[0] != _RESPQ_ID:
         ctor = bytes(body[:4]).hex() if len(body) >= 4 else "<short>"
-        return None, f"unknown response constructor {ctor}"
+        return _ResponseVerdict(
+            False, None, False, f"unknown response constructor {ctor}"
+        )
     if bytes(body[4:20]) != nonce:
-        return None, "resPQ received but nonce mismatch (spoofing/echo backend?)"
-    return None, "resPQ, nonce matched"
+        return _ResponseVerdict(
+            False,
+            None,
+            False,
+            "resPQ received but nonce mismatch (spoofing/echo backend?)",
+        )
+    return _ResponseVerdict(True, None, False, "resPQ, nonce matched")
 
 
 # ============================================================================
@@ -374,27 +411,31 @@ async def _ping_exchange(
     deadline = loop.time() + remaining
     while True:
         msg = framer.next_message()
-        if msg is not None:
-            break
-        budget = deadline - loop.time()
-        if budget <= 0:
-            raise _CheckError("ping", "timed out waiting for MTProto response")
-        try:
-            chunk = await asyncio.wait_for(recv_chunk(), timeout=budget)
-        except asyncio.TimeoutError as e:
-            raise _CheckError("ping", "timed out waiting for MTProto response") from e
-        except (ConnectionError, OSError) as e:
-            raise _CheckError("ping", f"connection dropped while reading response: {e}") from e
-        if not chunk:
-            raise _CheckError("ping", "connection closed before MTProto response")
-        framer.feed(keys_decryptor.update(chunk))
+        if msg is None:
+            budget = deadline - loop.time()
+            if budget <= 0:
+                raise _CheckError("ping", "timed out waiting for MTProto response")
+            try:
+                chunk = await asyncio.wait_for(recv_chunk(), timeout=budget)
+            except asyncio.TimeoutError as e:
+                raise _CheckError("ping", "timed out waiting for MTProto response") from e
+            except (ConnectionError, OSError) as e:
+                raise _CheckError("ping", f"connection dropped while reading response: {e}") from e
+            if not chunk:
+                raise _CheckError("ping", "connection closed before MTProto response")
+            framer.feed(keys_decryptor.update(chunk))
+            continue
 
-    rtt_ms = (time.monotonic() - t0) * 1000.0
-    mtproto_error, detail = parse_response(msg, nonce)
-    if mtproto_error is not None:
-        collector.mtproto_error = mtproto_error
-        raise _CheckError("ping", detail)
-    raise _PingOK(detail, rtt_ms)
+        verdict = parse_response(msg, nonce)
+        if verdict.retry:
+            # nop/quick-ack: настоящего ответа ещё нет — ждём следующий фрейм.
+            # Шторма нет: каждый retry съедает целый фрейм с провода.
+            continue
+        if verdict.ok:
+            raise _PingOK(verdict.detail, (time.monotonic() - t0) * 1000.0)
+        if verdict.mtproto_error is not None:
+            collector.mtproto_error = verdict.mtproto_error
+        raise _CheckError("ping", verdict.detail)
 
 
 # ============================================================================
@@ -674,8 +715,8 @@ async def check_link(
         collector.add(e.stage, False, None, e.message)
         return collector.finish(e.message)
     except Exception as e:  # защита: проверка никогда не падает наружу
-        log.exception("[check] неожиданная ошибка")
-        return collector.finish(f"внутренняя ошибка проверки: {e!r}")
+        log.exception("[check] unexpected error")
+        return collector.finish(f"internal check error: {e!r}")
     return collector.finish(None)
 
 

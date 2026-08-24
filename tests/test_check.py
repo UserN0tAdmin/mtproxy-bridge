@@ -10,9 +10,11 @@
 
 """Тесты команды/библиотеки check (минимальный набор).
 
-Покрывают: фрейминг обоих транспортов, парсер resPQ/ошибок MTProto,
-direct-E2E против фейкового MTProxy (server-side obfuscated2 + resPQ)
-и WEB-E2E через MockRelay (carrier https) с MTProto-бэкендом.
+Покрывают: фрейминг обоих транспортов, парсер resPQ/ошибок MTProto
+(включая негатив: эхо-бэкенд, чужой nonce, bad_msg, nop/quick-ack),
+direct-E2E против фейкового MTProxy (server-side obfuscated2 + resPQ,
+плюс негативные режимы ответа) и WEB-E2E через MockRelay (carrier https)
+с MTProto-бэкендом (плюс негатив «релей жив, бэкенд отвечает эхом»).
 """
 
 import asyncio
@@ -26,6 +28,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from test_web_integration import HOST, MockRelay
 
 from mtproxy_bridge.check import (
+    _BAD_MSG_NOTIFICATION_ID,
+    _REQ_PQ_MULTI_ID,
     _RESPQ_ID,
     _FrameReader,
     build_req_pq_multi,
@@ -82,14 +86,78 @@ def test_parse_respq_ok():
         return struct.pack("<Q", 0) + struct.pack("<q", 2) \
             + struct.pack("<i", len(body)) + body
 
-    error, detail = parse_response(_respq(nonce), nonce)
-    assert error is None and detail == "resPQ, nonce matched"
+    v = parse_response(_respq(nonce), nonce)
+    assert v.ok and not v.retry and v.mtproto_error is None
+    assert v.detail == "resPQ, nonce matched"
 
 
 def test_parse_mtproto_error_404():
-    error, detail = parse_response(struct.pack("<i", -404), b"x" * 16)
-    assert error == -404
-    assert "wrong secret" in detail
+    v = parse_response(struct.pack("<i", -404), b"x" * 16)
+    assert not v.ok and not v.retry
+    assert v.mtproto_error == -404
+    assert "wrong secret" in v.detail
+
+
+# Негативы парсера: успех — ровно resPQ с эхом nonce, всё остальное провал.
+
+
+def test_parse_garbage_not_ok():
+    # Мусор ≥16 байт с ненулевым auth_key_id (DPI-инъекция, чужой протокол).
+    v = parse_response(b"HTTP/1.1 302 Found\r\n\r\n" + b"\x00" * 16, b"n" * 16)
+    assert not v.ok and not v.retry and v.mtproto_error is None
+
+
+def test_parse_echo_backend_not_ok():
+    # Эхо вернуло наш же req_pq_multi — это не resPQ.
+    nonce = secrets.token_bytes(16)
+    echo = (
+        struct.pack("<Q", 0) + struct.pack("<q", 1)
+        + struct.pack("<i", 20) + struct.pack("<I", _REQ_PQ_MULTI_ID) + nonce
+    )
+    v = parse_response(echo, nonce)
+    assert not v.ok and not v.retry and v.mtproto_error is None
+    assert "unknown response constructor" in v.detail
+
+
+def test_parse_respq_nonce_mismatch_not_ok():
+    nonce = secrets.token_bytes(16)
+    body = struct.pack("<I", _RESPQ_ID) + secrets.token_bytes(16)
+    msg = (
+        struct.pack("<Q", 0) + struct.pack("<q", 2)
+        + struct.pack("<i", len(body)) + body
+    )
+    v = parse_response(msg, nonce)
+    assert not v.ok and not v.retry
+    assert "nonce mismatch" in v.detail
+
+
+def test_parse_bad_msg_notification_fail():
+    # bad_msg_notification#a7eff811 (bad_msg_id:long seqno:int code:int).
+    body = (
+        struct.pack("<I", _BAD_MSG_NOTIFICATION_ID) + struct.pack("<q", 1)
+        + struct.pack("<i", 0) + struct.pack("<i", 0)
+    )
+    msg = (
+        struct.pack("<Q", 0) + struct.pack("<q", 3)
+        + struct.pack("<i", len(body)) + body
+    )
+    v = parse_response(msg, b"n" * 16)
+    assert not v.ok and not v.retry and v.mtproto_error is None
+    assert "bad_msg_notification" in v.detail
+
+
+def test_parse_nop_and_quick_ack_retry():
+    # Код 0 и -1+seq — nop/quick-ack по TDLib Transport::read: не ответ,
+    # но и не ошибка; чтение продолжается до дедлайна.
+    v_nop = parse_response(struct.pack("<i", 0), b"x" * 16)
+    assert not v_nop.ok and v_nop.retry and v_nop.mtproto_error is None
+    v_qa = parse_response(struct.pack("<i", -1) + struct.pack("<I", 7), b"x" * 16)
+    assert not v_qa.ok and v_qa.retry and v_qa.mtproto_error is None
+
+
+def test_parse_too_short_fail():
+    v = parse_response(b"\x01\x02\x03", b"x" * 16)
+    assert not v.ok and not v.retry
 
 
 def test_check_invalid_link_is_result_not_exception():
@@ -154,8 +222,15 @@ async def _serve_respq(
     writer: asyncio.StreamWriter,
     secret: bytes,
     tag: bytes,
+    mode: str = "respq",
 ) -> None:
-    """Читает один framed req_pq_multi, отвечает resPQ тем же транспортом."""
+    """Читает один framed req_pq_multi и отвечает тем же транспортом.
+
+    Режимы: ``respq`` — канонический resPQ с эхом nonce (норма);
+    ``echo`` — эхо присланного сообщения (мусор вместо MTProto);
+    ``wrong_nonce`` — resPQ с чужим nonce; ``error404`` — числовой
+    код -404 (секрет не признан DC).
+    """
     try:
         obf = _ServerObf(await reader.readexactly(64), secret)
         framer = _FrameReader(tag)
@@ -167,28 +242,57 @@ async def _serve_respq(
             msg = framer.next_message()
             if msg is not None:
                 nonce = msg[24:40]  # auth(8)+msg_id(8)+size(4)+ctor(4)
-                writer.write(obf.encryptor.update(frame_payload(tag, _build_respq(nonce))))
+                if mode == "echo":
+                    answer = msg
+                elif mode == "wrong_nonce":
+                    answer = _build_respq(secrets.token_bytes(16))
+                elif mode == "error404":
+                    answer = struct.pack("<i", -404)
+                else:
+                    answer = _build_respq(nonce)
+                writer.write(obf.encryptor.update(frame_payload(tag, answer)))
                 await writer.drain()
                 return
     finally:
         writer.close()
 
 
-@pytest.fixture
-async def fake_mtproxy():
-    server = await asyncio.start_server(
+def _start_direct_server(mode: str):
+    """Фабрика TCP-сервера фейкового MTProxy для заданного режима ответа."""
+    return asyncio.start_server(
         lambda r, w: _serve_respq(r, w, bytes.fromhex(_DIRECT_SECRET_HEX),
-                                   TAG_ABRIDGED),
+                                   TAG_ABRIDGED, mode),
         "127.0.0.1", 0,
     )
+
+
+@pytest.fixture
+async def fake_mtproxy():
+    server = await _start_direct_server("respq")
     port = server.sockets[0].getsockname()[1]
     yield port
     server.close()
     await server.wait_closed()
 
 
+@pytest.fixture(params=["echo", "wrong_nonce", "error404"],
+                ids=["bad-echo", "bad-wrong-nonce", "bad-mtproto-error"])
+async def bad_mtproxy(request):
+    """Фейковый MTProxy, отвечающий на ping НЕ каноническим resPQ."""
+    server = await _start_direct_server(request.param)
+    port = server.sockets[0].getsockname()[1]
+    yield request.param, port
+    server.close()
+    await server.wait_closed()
+
+
 class ResPQRelay(MockRelay):
-    """MockRelay с MTProto-бэкендом вместо эха (для WEB-check)."""
+    """MockRelay с MTProto-бэкендом вместо эха (для WEB-check).
+
+    ``backend_mode="echo"`` (атрибут экземпляра, ставится тестом) —
+    симуляция аварии «релей жив, MTProto-бэкенд отвечает мусором»:
+    присланное сообщение возвращается как есть вместо resPQ.
+    """
 
     async def _pipe_obf(self, session, stream_id, reader, writer, secret):
         try:
@@ -202,11 +306,17 @@ class ResPQRelay(MockRelay):
                 msg = framer.next_message()
                 if msg is not None:
                     nonce = msg[24:40]
+                    if getattr(self, "backend_mode", "") == "echo":
+                        # Фрейм-ридер отдаёт payload вместе с паддингом
+                        # (0..15 байт), поэтому длину эха добиваем до
+                        # кратности 4 — frame_payload требует %4 == 0.
+                        answer = msg + b"\x00" * (-len(msg) % 4)
+                    else:
+                        answer = _build_respq(nonce)
                     session.push(stream_id, f.encode(
                         f.FrameType.DATA, stream_id,
                         obf.encryptor.update(
-                            frame_payload(TAG_PADDED_INTERMEDIATE,
-                                          _build_respq(nonce))),
+                            frame_payload(TAG_PADDED_INTERMEDIATE, answer)),
                     ))
                     return
         finally:
@@ -268,6 +378,25 @@ async def test_check_direct_ok(fake_mtproxy):
     assert result.to_dict()["ok"] is True
 
 
+async def test_check_direct_negative_ping(bad_mtproxy):
+    """Мусор/чужой nonce/-404 из туннеля — провал пинга, а не успех."""
+    mode, port = bad_mtproxy
+    link = (
+        f"tg://proxy?server=127.0.0.1&port={port}"
+        f"&secret={_DIRECT_SECRET_HEX}"
+    )
+    result = await check_link(link, timeout=10.0)
+    assert not result.ok, f"ложный «жив» при mode={mode}: {result.error}"
+    assert [s.name for s in result.stages] == ["parse", "connect", "ping"]
+    assert result.stages[-1].ok is False
+    assert result.stage == "ping"
+    if mode == "error404":
+        assert result.mtproto_error == -404
+    else:
+        assert result.mtproto_error is None
+    assert result.error
+
+
 async def test_check_web_ok(web_relay):
     link_str = f"tg://webproxy?server={HOST}&secret={_WEB_SECRET_HEX}"
     web_link = parse_web_link(link_str)
@@ -281,3 +410,22 @@ async def test_check_web_ok(web_relay):
     assert result.mode == "web"
     assert result.transport == "padded intermediate"
     assert result.carrier == "https"  # MockRelay default
+
+
+async def test_check_web_negative_echo(web_relay):
+    """WEB: релей жив (bootstrap/carrier ОК), но бэкенд эхом возвращает мусор."""
+    link_str = f"tg://webproxy?server={HOST}&secret={_WEB_SECRET_HEX}"
+    web_link = parse_web_link(link_str)
+    web_relay.capability = web_link.capability
+    web_relay.mtproto_secret = web_link.secret_key
+    web_relay.backend_mode = "echo"  # включает негативную ветку _pipe_obf
+
+    origin = f"http://127.0.0.1:{web_relay.port}"
+    result = await check_link(link_str, timeout=15.0, web_origin=origin)
+    assert not result.ok, f"ложный «жив»: {result.error}"
+    assert result.mode == "web"
+    assert [s.name for s in result.stages] == ["parse", "session", "ping"]
+    assert result.stages[-1].ok is False
+    assert result.stage == "ping"
+    assert result.mtproto_error is None
+    assert "unknown response constructor" in (result.error or "")
