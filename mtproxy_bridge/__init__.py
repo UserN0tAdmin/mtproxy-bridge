@@ -36,7 +36,7 @@ bare 16-byte secrets). After the handshake, bytes are relayed end-to-end as-is.
 
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.3.2"
 
 from .check import CheckResult, StageResult, check_link, check_link_sync
 from .config import BridgeConfig
