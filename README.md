@@ -22,6 +22,7 @@ Kurigram и подобные клиенты такие протоколы не �
 
 - **Автоопределение транспорта** — тип секрета (`dd` / `ee` / голый 16-байтовый) определяется автоматически; нужный клиенту транспорт отдаёт `needs_padded_transport()`.
 - **Поддержка WEB Proxy** — ссылки `tg://webproxy` / `t.me/webproxy`: bridge-capability из HMAC(секрет), bootstrap через страницу релея, все 4 carrier-режима (`https`, `https-lanes`, `websocket`, `websocket-lanes`), flow-control окна 4 МиБ.
+- **Проверка прокси** — `check_link()` / `mtproxy-bridge check`: настоящий MTProto-ping (`req_pq_multi` → `resPQ`) через туннель со сверкой эхо-nonce; поэтапный отчёт, RTT, JSON-вывод для скриптов и мониторинга.
 - **Точная эмуляция TDLib** — ClientHello (GREASE-значения, блоки M/E, X25519-ключ) собирается по тем же правилам, что и `TlsHello::get_default`.
 - **Автоопределение DC** — по IP или hostname через встроенную таблицу дата-центров (аналог `ConnectionCreator::get_default_dc_options`); есть ручной override.
 - **CLI и библиотека** — разовый запуск из терминала или встраивание в приложение перед созданием Kurigram-клиента.

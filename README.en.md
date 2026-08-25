@@ -22,6 +22,7 @@ Kurigram and similar clients understand neither protocol, but they do know how t
 
 - **Automatic transport detection** — the secret type (`dd` / `ee` / bare 16-byte) is detected automatically; `needs_padded_transport()` reports which transport the client needs.
 - **WEB Proxy support** — `tg://webproxy` / `t.me/webproxy` links: bridge capability derived via HMAC(secret, host), bootstrap through the relay's page, all 4 carrier modes (`https`, `https-lanes`, `websocket`, `websocket-lanes`), 4 MiB flow-control windows.
+- **Proxy health-check** — `check_link()` / `mtproxy-bridge check`: a real MTProto ping (`req_pq_multi` → `resPQ`) through the tunnel with echo-nonce verification; staged report, RTT, JSON output for scripts and monitoring.
 - **Accurate TDLib emulation** — the ClientHello (GREASE values, M/E blocks, X25519 key) is built following the same rules as `TlsHello::get_default`.
 - **Automatic DC detection** — by IP or hostname, via a built-in data-center table (analogous to `ConnectionCreator::get_default_dc_options`); manual override available.
 - **CLI and library** — one-off runs from the terminal, or embed it in an application before creating the Kurigram client.
