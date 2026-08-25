@@ -93,12 +93,19 @@ def parse_retry_after(value: str | None) -> float:
     try:
         seconds = int(value)
     except ValueError:
+        pass
+    else:
+        return max(0.0, min(float(seconds), _RETRY_AFTER_CAP_SECS))
+    try:
         parsed = email.utils.parsedate_to_datetime(value)
-        if parsed is None:
-            return 0.0
-        delta = parsed.timestamp() - time.time()
-        return max(0.0, min(delta, _RETRY_AFTER_CAP_SECS))
-    return max(0.0, min(float(seconds), _RETRY_AFTER_CAP_SECS))
+    except (ValueError, TypeError):
+        # Мусорный заголовок ≡ отсутствует: backoff вместо краха сессии
+        # (SECURITY_AUDIT F-3); TypeError — Python <= 3.9.
+        return 0.0
+    if parsed is None:  # pragma: no cover - страховка, совр. CPython бросает
+        return 0.0
+    delta = parsed.timestamp() - time.time()
+    return max(0.0, min(delta, _RETRY_AFTER_CAP_SECS))
 
 
 def canonical_uint(value: str) -> int:

@@ -119,17 +119,18 @@ def pack_batch(
         payload = queue[count]
         fr, nb = frame_bound(payload, batch_limit)
         whole = nb == len(payload)
-        if count == 0 and not whole:
-            head = payload[:nb]
-            if fr == 1 and nb == len(payload):
-                # Единственный фрейм не влезает в лимит сам по себе.
+        if count == 0:
+            if whole and fr == 1 and len(payload) > batch_limit:
+                # Резать нечего: одиночный фрейм крупнее лимита — падаем сразу.
                 raise FrameError(
                     f"frame of {len(payload)} bytes exceeds batch limit"
                 )
-            queue[0] = payload[nb:]
-            if on_head_split is not None:
-                on_head_split()
-            return head, nb, 1
+            if not whole:
+                head = payload[:nb]
+                queue[0] = payload[nb:]
+                if on_head_split is not None:
+                    on_head_split()
+                return head, nb, 1
         if count > 0 and (
             total + len(payload) > batch_limit or frames + fr > f.MAX_BATCH_FRAMES
         ):
@@ -477,17 +478,26 @@ class LaneBasedCarrier(BaseCarrier):
             log.debug("[web-carrier %s] drop late frame(s) for lane %d",
                       self.mode, lane_id)
             return
-        while not self._stopping and (
-            self._queued_bytes + len(payload) > UPLINK_QUEUE_BYTES
-            or self._queued_items >= UPLINK_QUEUE_ITEMS
-            or lane.bytes + len(payload) > LANE_QUEUE_BYTES
-            or lane.items >= LANE_QUEUE_ITEMS
-        ):
+        while True:
+            if self._stopping:
+                raise CarrierFailure("carrier is shutting down")
+            # forget_lane мог отсоединить лейн, пока enqueue спал: identity-
+            # сравнение не даёт протечь счётчикам в мёртвый объект.
+            live = self._lanes.get(lane_id)
+            if live is not lane or lane.closed:
+                log.debug("[web-carrier %s] drop late frame(s) for lane %d",
+                          self.mode, lane_id)
+                return
+            if not (
+                self._queued_bytes + len(payload) > UPLINK_QUEUE_BYTES
+                or self._queued_items >= UPLINK_QUEUE_ITEMS
+                or lane.bytes + len(payload) > LANE_QUEUE_BYTES
+                or lane.items >= LANE_QUEUE_ITEMS
+            ):
+                break
             lane.wake.set()  # проснуться, если виноват был бюджет лейна
             self._not_full.clear()
             await self._not_full.wait()
-        if self._stopping:
-            raise CarrierFailure("carrier is shutting down")
         lane.pending.append(payload)
         lane.bytes += len(payload)
         lane.items += 1
@@ -525,7 +535,8 @@ class LaneBasedCarrier(BaseCarrier):
         if lane.bytes or lane.items:
             self._queued_bytes -= lane.bytes
             self._queued_items -= lane.items
-            self._not_full.set()
+        # Будим безусловно: спящий enqueue обязан увидеть tombstone.
+        self._not_full.set()
         lane.pending.clear()
         lane.bytes = 0
         lane.items = 0

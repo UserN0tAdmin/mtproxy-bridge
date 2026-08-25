@@ -90,10 +90,11 @@ class WebStream:
     # Сторона приложения
 
     async def write(self, data: bytes) -> None:
-        """Отправляет DATA в пределах кредита окна (режется по 64 КиБ)."""
+        """Отправляет DATA в пределах кредита окна (режется по DATA_CHUNK
+        туннеля: ≤64 КиБ и не больше batch_limit релея минус заголовок)."""
         view = memoryview(data)
         while len(view):
-            size = min(f.DATA_CHUNK, len(view))
+            size = min(self._tunnel._data_chunk, len(view))
             while self._credit < size:
                 if self._error is not None:
                     raise self._error
@@ -174,6 +175,8 @@ class WebTunnel:
         self._carrier: BaseCarrier | None = None
         self._session_token = ""
         self._carrier_mode = ""
+        # Уточняется после bootstrap'а: фрейм обязан влезать в батч релея.
+        self._data_chunk = f.DATA_CHUNK
         self._streams: dict[int, WebStream] = {}
         self._next_stream_id = 1
         self._setup_lock = asyncio.Lock()
@@ -450,6 +453,11 @@ class WebTunnel:
             self._link.capability[:8],
         )
         page = await fetch_bridge_page(self._api, self._link.capability)
+        # Фрейм (кусок + заголовок) обязан влезать в batch_limit релея;
+        # нижняя граница — защита от бессмысленных значений.
+        self._data_chunk = max(
+            min(f.DATA_CHUNK, page.batch_limit - f.HEADER_SIZE), 1
+        )
         resp = await self._api.create_session(page.token, f.hello_frame())
         if resp.status != 200:
             raise BootstrapRejected(

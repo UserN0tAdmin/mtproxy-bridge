@@ -32,7 +32,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from mtproxy_bridge.links import parse_web_link
 from mtproxy_bridge.web import frames as f
 from mtproxy_bridge.web.bootstrap import fetch_bridge_page
-from mtproxy_bridge.web.carriers import pack_batch
+from mtproxy_bridge.web.carriers import build_carrier, pack_batch
+from mtproxy_bridge.web.frames import FrameError
 from mtproxy_bridge.web.http_api import BootstrapRejected, WebApi
 from mtproxy_bridge.web.tunnel import WebTunnel
 
@@ -130,12 +131,17 @@ class MockRelay:
         backend_port: int,
         carrier_mode: str = "https",
         mtproto_secret: bytes | None = None,
+        batch_limit: int = 2 * 1024 * 1024,
     ) -> None:
         assert carrier_mode in ("https", "https-lanes", "websocket",
                                 "websocket-lanes")
         self.backend_port = backend_port
         self.carrier_mode = carrier_mode
         self.mtproto_secret = mtproto_secret
+        # Как настоящий релей: тела /up и WS-сообщения сверх объявленного
+        # лимита батча отклоняются (иначе регрессия oversized-frame была бы
+        # для мока невидима).
+        self.batch_limit = batch_limit
         self.port: int | None = None
         self.capability: str | None = None
         self.bootstrap_token = _random_token()
@@ -170,7 +176,8 @@ class MockRelay:
             f'const relayOrigin="https://{HOST}",'
             f'bootstrap="{self.bootstrap_token}",'
             f'carrierMode="{self.carrier_mode}";'
-            "</script><script>let batchLimit=2097152;</script>"
+            "</script><script>let batchLimit="
+            f"{self.batch_limit};</script>"
         )
         return web.Response(text=html, content_type="text/html")
 
@@ -203,7 +210,10 @@ class MockRelay:
         session = self.session
         if auth != f"Bearer {self.session_token}" or session is None:
             return web.Response(status=404)
-        for frame in f.parse_batch(await request.read()):
+        body = await request.read()
+        if len(body) > self.batch_limit:
+            return web.Response(status=413)
+        for frame in f.parse_batch(body):
             stream_id = frame.stream_id
             if stream_id == 0:
                 continue  # PONG/WINDOW-control на нулевом потоке игнорируем
@@ -357,6 +367,8 @@ class MockRelay:
                 if msg.type != WSMsgType.BINARY:
                     break
                 if msg.data:
+                    if len(msg.data) > self.batch_limit:
+                        break  # сверхлимитное сообщение — разрыв сокета
                     ok = await self._process_batch(session, msg.data)
                     if not ok:
                         break
@@ -717,3 +729,155 @@ def test_pack_batch_split_keeps_item_accounting_balanced():
 
     assert queued_bytes == 0
     assert queued_items == 0
+
+
+def test_pack_batch_rejects_single_oversized_frame():
+    """Регрессия N-1: guard «фрейм крупнее лимита» был мёртвым кодом — его
+    условие (nb == len(payload)) противоречило внешней ветке not whole, и
+    одиночный фрейм больше лимита уходил наружу, где релей отклонял /up и
+    ронял сессию. Теперь это честный FrameError на месте."""
+    frame = f.encode(f.FrameType.DATA, 1, b"x" * 200)  # 208 байт > лимита 128
+    queue = deque([frame])
+    with pytest.raises(FrameError, match="exceeds batch limit"):
+        pack_batch(queue, 128)
+    # Очередь не испорчена: элемент остался на месте.
+    assert list(queue) == [frame]
+
+
+def test_pack_batch_allows_frame_exactly_at_limit():
+    """Граничный случай: фрейм ровно размера лимита валиден (не > лимита)."""
+    payload = b"x" * 120
+    frame = f.encode(f.FrameType.DATA, 1, payload)  # ровно 128 байт
+    queue = deque([frame])
+    body, nbytes, count = pack_batch(queue, 128)
+    assert count == 1 and nbytes == 128
+    assert body == frame and not queue
+
+
+# ---------------------------------------------------------------------------
+# E2E: нижний кламп batchLimit (64 КиБ) при DATA-куске 64 КиБ.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=ALL_MODES)
+async def tight_batch_relay(request, echo_server):
+    """Релей, анонсирующий и соблюдающий ровно нижний кламп batchLimit
+    (64 КиБ): полный DATA-кусок по умолчанию (65536 + 8 заголовка) раньше
+    превышал такой лимит, и релей отклонял /up, роняя сессию."""
+    mock = MockRelay(
+        echo_server, carrier_mode=request.param, batch_limit=64 * 1024
+    )
+    runner = web.AppRunner(mock.make_app(), shutdown_timeout=2)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    mock.port = runner.addresses[0][1]
+    yield mock
+    await runner.cleanup()
+
+
+async def test_full_size_data_chunk_survives_floor_batch_limit(
+    tight_batch_relay,
+):
+    """Регрессия N-1 (prevention): туннель ужимает DATA-куски до
+    batch_limit - HEADER_SIZE, поэтому ни один фрейм не превышает батч,
+    объявленный релеем, даже на нижнем клампе 64 КиБ."""
+    tunnel = _make_tunnel(tight_batch_relay)
+    stream = await tunnel.open_stream()
+    # batchLimit зажат полом до 65536 → чанк обязан стать 65528.
+    assert tunnel._data_chunk == 65528
+
+    payload = os.urandom(192 * 1024)  # несколько полных кусков подряд
+    received = bytearray()
+
+    async def reader():
+        while len(received) < len(payload):
+            chunk = await stream.read()
+            if not chunk:
+                break
+            received.extend(chunk)
+
+    read_task = asyncio.create_task(reader())
+    await stream.write(payload)
+    await asyncio.wait_for(read_task, timeout=60)
+    assert bytes(received) == payload
+    await tunnel.close_stream(stream.stream_id)
+    await tunnel.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Гонка enqueue ↔ forget_lane (N-2).
+# ---------------------------------------------------------------------------
+
+
+class _FakeLanesApi:
+    """API-заглушка: /up подтверждает сразу, /down паркуется до отмены."""
+
+    def __init__(self) -> None:
+        self.ups: list[tuple[int, bytes, int]] = []
+
+    async def up(self, token, sequence, body, *, lane_id=None):
+        self.ups.append((sequence, body, lane_id or 0))
+
+    async def down(self, token, cursor, *, lane_id=None):
+        await asyncio.Event().wait()  # отменяется aclose/forget_lane
+
+
+async def test_enqueue_tombstone_when_lane_forgotten_while_waiting(monkeypatch):
+    """Регрессия N-2: enqueue, заснувший на бюджете лейна, обязан после
+    пробуждения перепроверить lane.closed/identity. Без этого append в лейн,
+    забытый forget_lane во время ожидания, навсегда протекает в глобальный
+    бюджет очереди (release для отсоединённого объекта уже не случится)."""
+    monkeypatch.setattr("mtproxy_bridge.web.carriers.LANE_QUEUE_BYTES", 16)
+
+    async def on_inbound(batch: bytes) -> None:
+        raise AssertionError("inbound not expected in this test")
+
+    failures: list[BaseException] = []
+
+    async def on_failure(exc: BaseException) -> None:
+        failures.append(exc)
+
+    api = _FakeLanesApi()
+    carrier = build_carrier(
+        "https-lanes",
+        api=api,  # type: ignore[arg-type]
+        session_token="tok",
+        batch_limit=2 * 1024 * 1024,
+        on_inbound=on_inbound,
+        on_failure=on_failure,
+    )
+    await carrier.start()
+
+    # Здоровый путь: enqueue в живой лейн проходит и дренируется sender'ом.
+    # enqueue принимает закодированные батчи фреймов — сырые байты дали бы
+    # FrameError уже в pack_batch.
+    await carrier.ensure_lane(5)
+    healthy_frame = f.encode(f.FrameType.DATA, 5, b"ok")
+    await asyncio.wait_for(carrier.enqueue(healthy_frame, lane_id=5), timeout=5)
+    deadline = time.monotonic() + 5
+    while carrier._queued_items and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert carrier._queued_bytes == 0
+    assert carrier._queued_items == 0
+    assert [seq for seq, _, lane in api.ups if lane == 5] == [1]
+
+    # Гонка: enqueue паркуется на бюджете лейна, лейн забывают mid-wait.
+    # Полный DATA-фрейм из 32 байт payload = 40 байт > урезанного бюджета.
+    parked_payload = f.encode(f.FrameType.DATA, 5, b"x" * 32)
+    parked = asyncio.create_task(carrier.enqueue(parked_payload, lane_id=5))
+    for _ in range(50):
+        if parked.done():
+            break
+        await asyncio.sleep(0.01)
+    assert not parked.done(), "enqueue должен ждать освобождения бюджета"
+
+    await carrier.forget_lane(5)
+    # Тихий tombstone: без исключения, глобальный бюджет не тронут.
+    await asyncio.wait_for(parked, timeout=5)
+    assert parked.exception() is None
+    assert carrier._queued_bytes == 0
+    assert carrier._queued_items == 0
+    assert 5 not in carrier._lanes
+    assert not failures
+    await carrier.aclose(grace=0.0)
