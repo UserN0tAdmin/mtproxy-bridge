@@ -171,12 +171,12 @@ def _prepare_client_hello_rules(
     if use_block_e:
         esni_entries = [
             S(b"\xfe\x0d"),
-            Scope(S(b"\x00\x00\x01\x00\x01"), R(1), S(b"\x00\x20"), R(32), Scope(E())),
+            Scope(S(b"\x00\x00\x01\x00\x01"), R(1), S(b"\x00\x20"), K(), Scope(E())),
         ]
     else:
         esni_entries = [
             S(b"\xfe\x0d"),
-            Scope(S(b"\x00\x00\x01\x00\x01"), R(1), S(b"\x00\x20"), R(32)),
+            Scope(S(b"\x00\x00\x01\x00\x01"), R(1), S(b"\x00\x20"), K()),
         ]
 
     return [
@@ -211,7 +211,8 @@ def _prepare_client_hello_rules(
                         [
                             S(
                                 bytes.fromhex(
-                                    "000d0012001004030804040105030805050108060601"
+                                    "000d00180016090409050906040308040401050308"
+                                    "05050108060601"
                                 )
                             )
                         ],
