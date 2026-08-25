@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections import deque
 from typing import Awaitable, Callable, ClassVar
 
@@ -642,6 +643,19 @@ class WsLanesCarrier(LaneBasedCarrier):
                               lambda ln=lane: self._lane_writer(ln))
             )
         )
+
+    async def _teardown_transport(self) -> None:
+        # Лейн-таски _cancel_tasks не отменяет, и сокеты сами себя не закроют:
+        # без этого WS переживают смерть carrier'а до конца aiohttp-сессии.
+        # Закрытие ниже будит читателей, те завершаются через forget_lane;
+        # list(...) терпит их параллельную мутацию словаря.
+        for lane in list(self._lanes.values()):
+            socket = lane.socket
+            lane.socket = None
+            lane.socket_ready.clear()
+            if socket is not None and not socket.closed:
+                with contextlib.suppress(Exception):
+                    await socket.close()
 
     async def _lane_socket(self, lane: _LaneState) -> None:
         expected = f"tproxy-lane-v1.{self._token}.{lane.lane_id}"
