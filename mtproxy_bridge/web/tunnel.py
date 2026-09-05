@@ -467,10 +467,13 @@ class WebTunnel:
         if not token:
             raise ProtocolViolation("missing X-Session-Token header")
         announced_mode = resp.headers.get("X-Carrier-Mode") or ""
-        if announced_mode != page.carrier_mode:
+        # Старый формат: страница фиксирует один режим. Новый
+        # (carrierCapabilities): сервер сам выбирает любой из объявленных.
+        allowed = page.allowed_modes or frozenset({page.carrier_mode})
+        if announced_mode not in allowed:
             raise ProtocolViolation(
                 f"carrier mode mismatch: page={page.carrier_mode!r}, "
-                f"header={announced_mode!r}"
+                f"allowed={sorted(allowed)}, header={announced_mode!r}"
             )
         try:
             welcome = f.parse_batch(resp.body)

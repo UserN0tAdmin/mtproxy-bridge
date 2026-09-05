@@ -22,14 +22,29 @@
 токен (2 минуты жизни) встроен в JavaScript страницы. Браузерный bridge
 исполняет этот JS — мост вместо этого извлекает значения регулярками.
 
-Формат референсной страницы (tproxy-server internal/bridge/page.go):
+Поддерживаемые форматы страницы:
 
-    const relayOrigin="https://H",bootstrap="<token>",carrierMode="<mode>";
+1. Классический tproxy-server (``internal/bridge/page.go``)::
 
-Telemt рендерит ту же страницу в своём варианте (src/web/bridge.rs) —
-переменная carrier объявлена без слова «mode» и в одинарных кавычках:
+       const relayOrigin="https://H",bootstrap="<token>",carrierMode="<mode>";
 
-    const relayOrigin='https://H',bootstrap='<token>',carrier='<mode>';
+2. Старый Telemt (фиксированный carrier)::
+
+       const relayOrigin='https://H',bootstrap='<token>',carrier='<mode>';
+
+3. Новый Telemt / tproxy с carrier negotiation (``carrierCapabilities``)::
+
+       const bootstrap="<token>";
+       const relayOrigin='https://H',carrierCapabilities='https,https-lanes,...';
+       const negotiationEnabled=false,...;
+       let ... carrier='';
+
+   При отсутствии фиксированного ``carrierMode``/``carrier`` парсер берёт
+   список из ``carrierCapabilities`` и выбирает предпочтительный режим
+   в порядке: websocket-lanes → websocket → https-lanes → https.
+   Сервер при ``negotiationEnabled=false`` сам назначает режим в
+   ``X-Carrier-Mode`` ответа ``POST /api/v1/session``; клиент принимает
+   любой режим из объявленных capabilities.
 
 Парсер терпим к регистру, разделителям (``=``/``:``) и кавычкам, но строг
 к формату значений; строки вида ``carrier==='websocket'`` (сравнение)
@@ -50,11 +65,25 @@ CARRIER_MODES = frozenset(
     {"https", "https-lanes", "websocket", "websocket-lanes"}
 )
 
+# Предпочтительный порядок при разборе carrierCapabilities (новый формат).
+PREFERRED_CARRIER_ORDER = (
+    "websocket-lanes",
+    "websocket",
+    "https-lanes",
+    "https",
+)
+
 _TOKEN_RE = re.compile(
     r"""bootstrap["']?\s*[:=]\s*["']([A-Za-z0-9_-]{43})["']""", re.IGNORECASE
 )
+# Фиксированный режим: carrierMode='…' / carrier='…' (не пустая строка).
+# Не матчит carrier='' и сравнения carrier==='…'.
 _CARRIER_MODE_RE = re.compile(
     r"""carrier(?:[_-]?mode)?["']?\s*[:=]\s*["']([a-z-]+)["']""",
+    re.IGNORECASE,
+)
+_CAPABILITIES_RE = re.compile(
+    r"""carrierCapabilities["']?\s*[:=]\s*["']([^"']+)["']""",
     re.IGNORECASE,
 )
 _BATCH_LIMIT_RE = re.compile(
@@ -67,8 +96,33 @@ class BridgePage:
     """Параметры, извлечённые из bridge-страницы."""
 
     token: str  # одноразовый bearer для POST /api/v1/session
-    carrier_mode: str
+    carrier_mode: str  # предпочтительный / объявленный режим
     batch_limit: int
+    # Допустимые режимы с точки зрения страницы. Для старого формата —
+    # один элемент; для carrierCapabilities — все распознанные режимы.
+    # Сервер может выбрать любой из них (см. X-Carrier-Mode).
+    allowed_modes: frozenset[str] = frozenset()
+
+
+def _select_preferred_mode(available: set[str]) -> str:
+    """Выбирает режим по PREFERRED_CARRIER_ORDER из пересечения с available."""
+    for mode in PREFERRED_CARRIER_ORDER:
+        if mode in available:
+            return mode
+    # available уже отфильтрован по CARRIER_MODES, но на всякий случай.
+    raise BootstrapRejected(
+        "bridge page declares no supported carrier modes in capabilities"
+    )
+
+
+def _parse_capabilities(raw: str) -> set[str]:
+    """Разбирает CSV carrierCapabilities → множество известных режимов."""
+    modes: set[str] = set()
+    for part in raw.split(","):
+        mode = part.strip().lower()
+        if mode in CARRIER_MODES:
+            modes.add(mode)
+    return modes
 
 
 def parse_bridge_page(html: str) -> BridgePage:
@@ -76,7 +130,7 @@ def parse_bridge_page(html: str) -> BridgePage:
 
     Raises:
         BootstrapRejected: страница не содержит корректного токена или
-            объявляет неизвестный carrier-режим.
+            не объявляет ни фиксированный carrier-режим, ни capabilities.
     """
     token_match = _TOKEN_RE.search(html)
     if token_match is None:
@@ -84,14 +138,31 @@ def parse_bridge_page(html: str) -> BridgePage:
             "bridge page does not contain a valid bootstrap token "
             "(wrong capability or incompatible relay?)"
         )
+
     mode_match = _CARRIER_MODE_RE.search(html)
-    if mode_match is None:
+    capabilities_match = _CAPABILITIES_RE.search(html)
+
+    if mode_match is not None:
+        carrier_mode = mode_match.group(1).lower()
+        if carrier_mode not in CARRIER_MODES:
+            raise BootstrapRejected(
+                f"bridge page announces unknown carrier mode {carrier_mode!r}"
+            )
+        allowed = frozenset({carrier_mode})
+        if capabilities_match is not None:
+            caps = _parse_capabilities(capabilities_match.group(1))
+            if caps:
+                allowed = frozenset(caps | {carrier_mode})
+    elif capabilities_match is not None:
+        caps = _parse_capabilities(capabilities_match.group(1))
+        if not caps:
+            raise BootstrapRejected(
+                "bridge page carrierCapabilities contain no known modes"
+            )
+        carrier_mode = _select_preferred_mode(caps)
+        allowed = frozenset(caps)
+    else:
         raise BootstrapRejected("bridge page does not declare a carrier mode")
-    carrier_mode = mode_match.group(1).lower()
-    if carrier_mode not in CARRIER_MODES:
-        raise BootstrapRejected(
-            f"bridge page announces unknown carrier mode {carrier_mode!r}"
-        )
 
     batch_limit = DEFAULT_BATCH_LIMIT
     limit_match = _BATCH_LIMIT_RE.search(html)
@@ -103,6 +174,7 @@ def parse_bridge_page(html: str) -> BridgePage:
         token=token_match.group(1),
         carrier_mode=carrier_mode,
         batch_limit=batch_limit,
+        allowed_modes=allowed,
     )
 
 
