@@ -185,16 +185,21 @@ class WebApi:
         data: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
         query: dict[str, str] | None = None,
+        skip_content_type: bool = False,
     ) -> ApiResponse:
         session = await self._http()
         url = self._origin + path
         headers: dict[str, str] = {}
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
-        if data is not None:
+        if data is not None and not skip_content_type:
             headers["Content-Type"] = "application/octet-stream"
         if extra_headers:
             headers.update(extra_headers)
+
+        skip_auto: frozenset[str] | None = None
+        if skip_content_type:
+            skip_auto = frozenset({"Content-Type"})
 
         attempt = 0
         delay = _BACKOFF_BASE_SECS
@@ -208,10 +213,11 @@ class WebApi:
                     data=data,
                     headers=headers or None,
                     allow_redirects=False,
+                    skip_auto_headers=skip_auto,
                 ) as resp:
                     body = await resp.read()
                     status = resp.status
-                    resp_headers = resp.headers
+                    resp_headers = resp.headers.copy()
             except asyncio.CancelledError:
                 raise
             except (
@@ -308,7 +314,12 @@ class WebApi:
         *,
         lane_id: int | None = None,
     ) -> DownResult:
-        """``POST /api/v1/down`` — long poll; 204 = пусто, 200 = батч."""
+        """``POST /api/v1/down`` — long poll; 204 = пусто, 200 = батч.
+
+        Тело и Content-Type не отправляются: релей (telemt) трактует наличие
+        ``Content-Type`` на down как невалидный запрос и отвечает decoy
+        без ``X-Down-Cursor``.
+        """
         headers = {"X-Down-Cursor": str(cursor)}
         if lane_id is not None:
             headers["X-Lane-ID"] = str(lane_id)
@@ -316,19 +327,25 @@ class WebApi:
             "POST",
             "/api/v1/down",
             token=session_token,
-            data=None,
+            data=b"",
             extra_headers=headers,
+            skip_content_type=True,
         )
-        next_cursor = canonical_uint(resp.headers.get("X-Down-Cursor") or "")
+        if resp.status not in (200, 204):
+            raise ProtocolViolation(
+                f"downlink rejected: HTTP {resp.status} (cursor={cursor})"
+            )
+        cursor_raw = resp.headers.get("X-Down-Cursor")
+        if cursor_raw is None or cursor_raw == "":
+            raise ProtocolViolation(
+                f"downlink missing X-Down-Cursor (HTTP {resp.status})"
+            )
+        next_cursor = canonical_uint(cursor_raw)
         lane_closed = resp.headers.get("X-Lane-Closed") == "1"
         if resp.status == 204:
             if resp.body:
                 raise ProtocolViolation("204 down poll carried a body")
             return DownResult(False, next_cursor, b"", lane_closed)
-        if resp.status != 200:
-            raise ProtocolViolation(
-                f"downlink rejected: HTTP {resp.status} (cursor={cursor})"
-            )
         if not resp.body:
             raise ProtocolViolation("200 down poll without body")
         return DownResult(True, next_cursor, resp.body, lane_closed)
