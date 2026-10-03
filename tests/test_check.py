@@ -50,8 +50,9 @@ _WEB_SECRET_HEX = "dd00112233445566778899aabbccddeeff"
 # ============================================================================
 
 
-@pytest.mark.parametrize("tag", [TAG_ABRIDGED, TAG_PADDED_INTERMEDIATE],
-                         ids=["abridged", "padded"])
+@pytest.mark.parametrize(
+    "tag", [TAG_ABRIDGED, TAG_PADDED_INTERMEDIATE], ids=["abridged", "padded"]
+)
 def test_frame_roundtrip(tag):
     payload = build_req_pq_multi(secrets.token_bytes(16))
     framed = frame_payload(tag, payload)
@@ -79,12 +80,20 @@ def test_parse_respq_ok():
     def _respq(nonce16):
         pq = secrets.token_bytes(8)
         body = (
-            struct.pack("<I", _RESPQ_ID) + nonce16 + secrets.token_bytes(16)
-            + struct.pack("<i", len(pq)) + pq
-            + struct.pack("<i", 1) + struct.pack("<q", 0xC0FFEE)
+            struct.pack("<I", _RESPQ_ID)
+            + nonce16
+            + secrets.token_bytes(16)
+            + struct.pack("<i", len(pq))
+            + pq
+            + struct.pack("<i", 1)
+            + struct.pack("<q", 0xC0FFEE)
         )
-        return struct.pack("<Q", 0) + struct.pack("<q", 2) \
-            + struct.pack("<i", len(body)) + body
+        return (
+            struct.pack("<Q", 0)
+            + struct.pack("<q", 2)
+            + struct.pack("<i", len(body))
+            + body
+        )
 
     v = parse_response(_respq(nonce), nonce)
     assert v.ok and not v.retry and v.mtproto_error is None
@@ -111,8 +120,11 @@ def test_parse_echo_backend_not_ok():
     # Эхо вернуло наш же req_pq_multi — это не resPQ.
     nonce = secrets.token_bytes(16)
     echo = (
-        struct.pack("<Q", 0) + struct.pack("<q", 1)
-        + struct.pack("<i", 20) + struct.pack("<I", _REQ_PQ_MULTI_ID) + nonce
+        struct.pack("<Q", 0)
+        + struct.pack("<q", 1)
+        + struct.pack("<i", 20)
+        + struct.pack("<I", _REQ_PQ_MULTI_ID)
+        + nonce
     )
     v = parse_response(echo, nonce)
     assert not v.ok and not v.retry and v.mtproto_error is None
@@ -123,8 +135,10 @@ def test_parse_respq_nonce_mismatch_not_ok():
     nonce = secrets.token_bytes(16)
     body = struct.pack("<I", _RESPQ_ID) + secrets.token_bytes(16)
     msg = (
-        struct.pack("<Q", 0) + struct.pack("<q", 2)
-        + struct.pack("<i", len(body)) + body
+        struct.pack("<Q", 0)
+        + struct.pack("<q", 2)
+        + struct.pack("<i", len(body))
+        + body
     )
     v = parse_response(msg, nonce)
     assert not v.ok and not v.retry
@@ -134,12 +148,16 @@ def test_parse_respq_nonce_mismatch_not_ok():
 def test_parse_bad_msg_notification_fail():
     # bad_msg_notification#a7eff811 (bad_msg_id:long seqno:int code:int).
     body = (
-        struct.pack("<I", _BAD_MSG_NOTIFICATION_ID) + struct.pack("<q", 1)
-        + struct.pack("<i", 0) + struct.pack("<i", 0)
+        struct.pack("<I", _BAD_MSG_NOTIFICATION_ID)
+        + struct.pack("<q", 1)
+        + struct.pack("<i", 0)
+        + struct.pack("<i", 0)
     )
     msg = (
-        struct.pack("<Q", 0) + struct.pack("<q", 3)
-        + struct.pack("<i", len(body)) + body
+        struct.pack("<Q", 0)
+        + struct.pack("<q", 3)
+        + struct.pack("<i", len(body))
+        + body
     )
     v = parse_response(msg, b"n" * 16)
     assert not v.ok and not v.retry and v.mtproto_error is None
@@ -171,8 +189,17 @@ def test_check_result_serialization():
     result = asyncio.run(check_link("tg://webproxy?server=x&secret=zz"))
     d = result.to_dict()
     assert set(d) == {
-        "ok", "mode", "stage", "error", "mtproto_error", "rtt_ms",
-        "total_ms", "dc_id", "transport", "carrier", "stages",
+        "ok",
+        "mode",
+        "stage",
+        "error",
+        "mtproto_error",
+        "rtt_ms",
+        "total_ms",
+        "dc_id",
+        "transport",
+        "carrier",
+        "stages",
     }
     assert '"ok": false' in result.to_json(indent=2)
 
@@ -189,12 +216,14 @@ def _build_respq(nonce: bytes) -> bytes:
         struct.pack("<I", _RESPQ_ID)
         + nonce
         + secrets.token_bytes(16)  # server_nonce
-        + struct.pack("<i", len(pq)) + pq  # pq:string (%4 — паддинг не нужен)
-        + struct.pack("<i", 1) + struct.pack("<q", 0x123456789ABCDEF0)
+        + struct.pack("<i", len(pq))
+        + pq  # pq:string (%4 — паддинг не нужен)
+        + struct.pack("<i", 1)
+        + struct.pack("<q", 0x123456789ABCDEF0)
     )
     return (
-        struct.pack("<Q", 0)      # auth_key_id
-        + struct.pack("<q", 42)   # msg_id сервера
+        struct.pack("<Q", 0)  # auth_key_id
+        + struct.pack("<q", 42)  # msg_id сервера
         + struct.pack("<i", len(body))
         + body
     )
@@ -260,9 +289,11 @@ async def _serve_respq(
 def _start_direct_server(mode: str):
     """Фабрика TCP-сервера фейкового MTProxy для заданного режима ответа."""
     return asyncio.start_server(
-        lambda r, w: _serve_respq(r, w, bytes.fromhex(_DIRECT_SECRET_HEX),
-                                   TAG_ABRIDGED, mode),
-        "127.0.0.1", 0,
+        lambda r, w: _serve_respq(
+            r, w, bytes.fromhex(_DIRECT_SECRET_HEX), TAG_ABRIDGED, mode
+        ),
+        "127.0.0.1",
+        0,
     )
 
 
@@ -275,8 +306,10 @@ async def fake_mtproxy():
     await server.wait_closed()
 
 
-@pytest.fixture(params=["echo", "wrong_nonce", "error404"],
-                ids=["bad-echo", "bad-wrong-nonce", "bad-mtproto-error"])
+@pytest.fixture(
+    params=["echo", "wrong_nonce", "error404"],
+    ids=["bad-echo", "bad-wrong-nonce", "bad-mtproto-error"],
+)
 async def bad_mtproxy(request):
     """Фейковый MTProxy, отвечающий на ping НЕ каноническим resPQ."""
     server = await _start_direct_server(request.param)
@@ -313,11 +346,16 @@ class ResPQRelay(MockRelay):
                         answer = msg + b"\x00" * (-len(msg) % 4)
                     else:
                         answer = _build_respq(nonce)
-                    session.push(stream_id, f.encode(
-                        f.FrameType.DATA, stream_id,
-                        obf.encryptor.update(
-                            frame_payload(TAG_PADDED_INTERMEDIATE, answer)),
-                    ))
+                    session.push(
+                        stream_id,
+                        f.encode(
+                            f.FrameType.DATA,
+                            stream_id,
+                            obf.encryptor.update(
+                                frame_payload(TAG_PADDED_INTERMEDIATE, answer)
+                            ),
+                        ),
+                    )
                     return
         finally:
             session.writers.pop(stream_id, None)
@@ -365,8 +403,7 @@ async def web_relay():
 
 async def test_check_direct_ok(fake_mtproxy):
     link = (
-        f"tg://proxy?server=127.0.0.1&port={fake_mtproxy}"
-        f"&secret={_DIRECT_SECRET_HEX}"
+        f"tg://proxy?server=127.0.0.1&port={fake_mtproxy}&secret={_DIRECT_SECRET_HEX}"
     )
     result = await check_link(link, timeout=10.0)
     assert result.ok, f"{result.stage}: {result.error}"
@@ -381,10 +418,7 @@ async def test_check_direct_ok(fake_mtproxy):
 async def test_check_direct_negative_ping(bad_mtproxy):
     """Мусор/чужой nonce/-404 из туннеля — провал пинга, а не успех."""
     mode, port = bad_mtproxy
-    link = (
-        f"tg://proxy?server=127.0.0.1&port={port}"
-        f"&secret={_DIRECT_SECRET_HEX}"
-    )
+    link = f"tg://proxy?server=127.0.0.1&port={port}&secret={_DIRECT_SECRET_HEX}"
     result = await check_link(link, timeout=10.0)
     assert not result.ok, f"ложный «жив» при mode={mode}: {result.error}"
     assert [s.name for s in result.stages] == ["parse", "connect", "ping"]

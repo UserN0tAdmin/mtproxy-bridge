@@ -63,8 +63,7 @@ class TestCarrierModes:
         # Сравнения в JS обеих страниц не должны перехватывать поиск:
         # тройной '=' и закрывающая скобка ломают шаблон значения.
         html = (
-            _telemt_page("websocket-lanes")
-            + "<script>if(carrier==='websocket')x();"
+            _telemt_page("websocket-lanes") + "<script>if(carrier==='websocket')x();"
             "if(response.headers.get('X-Carrier-Mode')!==carrier)"
             "throw new Error('session creation rejected');</script>"
         )
@@ -85,10 +84,7 @@ class TestBatchLimit:
         assert parse_bridge_page(_go_page("https")).batch_limit == 2 * 1024 * 1024
 
     def test_snake_case_json_tolerated(self):
-        html = (
-            f"bootstrap: '{TOKEN}', 'carrier_mode': 'https', "
-            '"batch_limit": 262144'
-        )
+        html = f"bootstrap: '{TOKEN}', 'carrier_mode': 'https', \"batch_limit\": 262144"
         assert parse_bridge_page(html).batch_limit == 256 * 1024
 
     def test_missing_defaults_to_2mib(self):
@@ -96,9 +92,9 @@ class TestBatchLimit:
         assert parse_bridge_page(html).batch_limit == 2 * 1024 * 1024
 
     def test_clamped_to_desktop_ceiling_and_floor(self):
-        big = f'let batchLimit={16 * 1024 * 1024};' + _go_page("https")
+        big = f"let batchLimit={16 * 1024 * 1024};" + _go_page("https")
         assert parse_bridge_page(big).batch_limit == 2 * 1024 * 1024
-        small = 'let batchLimit=1024;' + _go_page("https")
+        small = "let batchLimit=1024;" + _go_page("https")
         assert parse_bridge_page(small).batch_limit == 64 * 1024
 
 

@@ -68,14 +68,19 @@ class TestParseBatch:
         ]
         assert [fr.stream_id for fr in parsed] == [1, 1, 2, 3, 0, 0, 0, 0, 0]
         assert [fr.payload for fr in parsed] == [
-            b"", b"hello", f.window_payload(4096), b"",
-            b"tok", b"tok", b"\x01", b"", b"reason",
+            b"",
+            b"hello",
+            f.window_payload(4096),
+            b"",
+            b"tok",
+            b"tok",
+            b"\x01",
+            b"",
+            b"reason",
         ]
 
     def test_single_frame_is_valid_batch(self):
-        assert f.parse_batch(f.hello_frame()) == [
-            Frame(FrameType.HELLO, 0, b"\x01")
-        ]
+        assert f.parse_batch(f.hello_frame()) == [Frame(FrameType.HELLO, 0, b"\x01")]
 
     def test_empty_batch_rejected(self):
         with pytest.raises(FrameError, match="empty"):

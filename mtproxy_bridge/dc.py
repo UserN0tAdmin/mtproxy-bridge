@@ -52,7 +52,6 @@ KNOWN_DC_IPS: dict[str, int] = {
     "149.154.175.53": 1,  # getConfig: static=True (старый)
     "149.154.175.55": 1,  # getConfig: primary + static=True (новый)
     "2001:b28:f23d:f001::a": 1,  # IPv6 primary
-
     # ===== DC 2 — Amsterdam (auth + API + media) =====
     "149.154.167.51": 2,  # TDLib bootstrap (legacy)
     "95.161.76.100": 2,  # TDLib bootstrap (legacy)
@@ -62,11 +61,9 @@ KNOWN_DC_IPS: dict[str, int] = {
     "149.154.167.151": 2,  # getConfig: media_only=True (новый)
     "2001:67c:4e8:f002::a": 2,  # IPv6 primary
     "2001:67c:4e8:f002::b": 2,  # IPv6 media_only=True
-
     # ===== DC 3 — Miami (auth + API) =====
     "149.154.175.100": 3,  # getConfig: primary, static=True
     "2001:b28:f23d:f003::a": 3,  # IPv6 primary
-
     # ===== DC 4 — Amsterdam (auth + API + media) =====
     "149.154.167.91": 4,  # getConfig: primary, static=True (старый)
     "149.154.167.92": 4,  # getConfig: primary + static=True (новый)
@@ -74,13 +71,11 @@ KNOWN_DC_IPS: dict[str, int] = {
     "149.154.167.43": 4,  # getConfig: media_only=True (новый)
     "2001:67c:4e8:f004::a": 4,  # IPv6 primary
     "2001:67c:4e8:f004::b": 4,  # IPv6 media_only=True
-
     # ===== DC 5 — Singapore (auth + API) =====
     "149.154.171.5": 5,  # TDLib bootstrap (legacy)
     "91.108.56.101": 5,  # getConfig: primary, static=True (старый)
     "91.108.56.168": 5,  # getConfig: primary + static=True (новый)
     "2001:b28:f23f:f005::a": 5,  # IPv6 primary
-
     # ===== Test DCs (TDLib test-mode bootstrap) — dc ID = 10000 + id =====
     "149.154.175.10": 10001,
     "149.154.167.40": 10002,
@@ -157,7 +152,9 @@ async def guess_dc_id_async(target_host: str) -> int:
             normalized_ip = _normalize_ip(ip)
             if normalized_ip in KNOWN_CDN_IPS:
                 cdn_dc = KNOWN_CDN_IPS[normalized_ip]
-                log.info(f"  [dc-id] CDN resolved {target_host} -> {ip} -> DC -{cdn_dc}")
+                log.info(
+                    f"  [dc-id] CDN resolved {target_host} -> {ip} -> DC -{cdn_dc}"
+                )
                 return -cdn_dc
             if normalized_ip in KNOWN_DC_IPS:
                 dc = KNOWN_DC_IPS[normalized_ip]

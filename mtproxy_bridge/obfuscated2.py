@@ -41,7 +41,6 @@ except ImportError as e:
     ) from e
 
 
-
 # Transport-теги (см. ObfuscatedTransport::init в td/mtproto/TcpTransport.cpp).
 TAG_ABRIDGED = b"\xef\xef\xef\xef"
 TAG_PADDED_INTERMEDIATE = b"\xdd\xdd\xdd\xdd"
@@ -64,7 +63,7 @@ _RESERVED_FIRST4 = {
     0x44414548,
     0x54534F50,
     0x20544547,
-    0x4954504f,
+    0x4954504F,
     0x02010316,
     0xDDDDDDDD,
     0xEEEEEEEE,
@@ -147,7 +146,9 @@ def build_obfuscated2_header(
     _, decryptor = _ctr_stream(decrypt_key, decrypt_iv)
 
     init[56:60] = protocol_tag
-    struct.pack_into("<h", init, 60, dc)  # signed int16, как TDLib: as<int16>(header+60)=dc_id_
+    struct.pack_into(
+        "<h", init, 60, dc
+    )  # signed int16, как TDLib: as<int16>(header+60)=dc_id_
 
     encrypted_tail = encryptor.update(bytes(init))[56:64]
     header = bytes(init[0:56]) + encrypted_tail

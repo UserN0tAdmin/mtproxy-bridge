@@ -70,8 +70,12 @@ async def _make_relay() -> tuple[WebApi, set[web.WebSocketResponse], web.AppRunn
 
 async def _open_two_lanes(api: WebApi) -> WsLanesCarrier:
     carrier = WsLanesCarrier(
-        api, "tok", batch_limit=65536,
-        on_inbound=_noop, on_failure=_noop, on_stream_reset=_noop,
+        api,
+        "tok",
+        batch_limit=65536,
+        on_inbound=_noop,
+        on_failure=_noop,
+        on_stream_reset=_noop,
     )
     for lane_id in (1, 2):
         await carrier.ensure_lane(lane_id)

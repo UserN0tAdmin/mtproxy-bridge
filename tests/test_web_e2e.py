@@ -45,7 +45,8 @@ async def test_socks5_web_bridge_end_to_end(relay):  # noqa: F811
     relay.mtproto_secret = web_link.secret_key
 
     port = await start_local_bridge(
-        link_str, listen_port=0,
+        link_str,
+        listen_port=0,
         web_origin=f"http://127.0.0.1:{relay.port}",
     )
     try:
@@ -55,9 +56,7 @@ async def test_socks5_web_bridge_end_to_end(relay):  # noqa: F811
         writer.write(b"\x05\x01\x00")
         assert await reader.readexactly(2) == b"\x05\x00"
         dc2_ip = bytes([149, 154, 167, 51])
-        writer.write(
-            b"\x05\x01\x00\x01" + dc2_ip + (443).to_bytes(2, "big")
-        )
+        writer.write(b"\x05\x01\x00\x01" + dc2_ip + (443).to_bytes(2, "big"))
         reply = await reader.readexactly(10)
         assert reply[:3] == b"\x05\x00\x00"  # succeeded
 
@@ -95,7 +94,8 @@ async def test_socks5_plain_secret_abridged(relay):  # noqa: F401, F811
     relay.mtproto_secret = web_link.secret_key
 
     port = await start_local_bridge(
-        link_str, listen_port=0,
+        link_str,
+        listen_port=0,
         web_origin=f"http://127.0.0.1:{relay.port}",
     )
     try:
@@ -134,7 +134,8 @@ async def test_socks5_client_dies_on_web_open_deadline(relay, monkeypatch):  # n
     monkeypatch.setattr("mtproxy_bridge.relay.WEB_STREAM_OPEN_TIMEOUT_SECS", 0.3)
 
     port = await start_local_bridge(
-        link_str, listen_port=0,
+        link_str,
+        listen_port=0,
         web_origin=f"http://127.0.0.1:{relay.port}",
     )
     try:
@@ -151,7 +152,7 @@ async def test_socks5_client_dies_on_web_open_deadline(relay, monkeypatch):  # n
         chunk = await asyncio.wait_for(reader.read(1024), timeout=10)
         elapsed = time.monotonic() - started
         assert chunk == b""  # мост сам закрыл соединение (EOF)
-        assert elapsed < 5   # быстро, а не после минут retry-циклов
+        assert elapsed < 5  # быстро, а не после минут retry-циклов
     finally:
         relay.hold_page.set()  # отпускаем обработчик релея перед уборкой
         await stop_all_bridges()

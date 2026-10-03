@@ -68,7 +68,7 @@ def _render_check_text(result) -> None:
     else:
         error = f": {result.error}" if result.error else ""
         label = _STAGE_LABELS.get(result.stage, result.stage)
-        print(f"\nProxy is NOT working — stage \"{label}\"{error}")
+        print(f'\nProxy is NOT working — stage "{label}"{error}')
 
 
 def _main_check(argv: list[str]) -> None:
@@ -85,21 +85,43 @@ def _main_check(argv: list[str]) -> None:
         help="tg://proxy?server=...&port=...&secret=... or "
         "tg://webproxy?server=...&secret=...",
     )
-    parser.add_argument("--timeout", type=float, default=15.0,
-                        help="total budget for all stages, seconds (default 15)")
-    parser.add_argument("--dc-id", type=int, default=2,
-                        help="data center ID for the obfuscated2 header (default 2)")
-    parser.add_argument("--json", action="store_true",
-                        help="machine-readable JSON output to stdout")
-    parser.add_argument("--debug", action="store_true", default=False,
-                        help="Enable DEBUG logging")
-    parser.add_argument("--no-ccs", action="store_true", default=False,
-                        help="Do not send CCS before the first AppData record "
-                        "(direct FakeTLS mode only)")
-    parser.add_argument("--no-block-m", action="store_true", default=False,
-                        help="Disable block M in ClientHello (direct FakeTLS mode only)")
-    parser.add_argument("--no-block-e", action="store_true", default=False,
-                        help="Disable block E in ClientHello (direct FakeTLS mode only)")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        help="total budget for all stages, seconds (default 15)",
+    )
+    parser.add_argument(
+        "--dc-id",
+        type=int,
+        default=2,
+        help="data center ID for the obfuscated2 header (default 2)",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="machine-readable JSON output to stdout"
+    )
+    parser.add_argument(
+        "--debug", action="store_true", default=False, help="Enable DEBUG logging"
+    )
+    parser.add_argument(
+        "--no-ccs",
+        action="store_true",
+        default=False,
+        help="Do not send CCS before the first AppData record "
+        "(direct FakeTLS mode only)",
+    )
+    parser.add_argument(
+        "--no-block-m",
+        action="store_true",
+        default=False,
+        help="Disable block M in ClientHello (direct FakeTLS mode only)",
+    )
+    parser.add_argument(
+        "--no-block-e",
+        action="store_true",
+        default=False,
+        help="Disable block E in ClientHello (direct FakeTLS mode only)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -107,14 +129,16 @@ def _main_check(argv: list[str]) -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    result = asyncio.run(check_link(
-        args.tg_link,
-        timeout=args.timeout,
-        dc_id=args.dc_id,
-        send_ccs=not args.no_ccs,
-        use_block_m=not args.no_block_m,
-        use_block_e=not args.no_block_e,
-    ))
+    result = asyncio.run(
+        check_link(
+            args.tg_link,
+            timeout=args.timeout,
+            dc_id=args.dc_id,
+            send_ccs=not args.no_ccs,
+            use_block_m=not args.no_block_m,
+            use_block_e=not args.no_block_e,
+        )
+    )
 
     if args.json:
         print(result.to_json(indent=2))
@@ -172,7 +196,11 @@ def main() -> None:
     )
 
     tunnel: WebTunnel | None = None
-    if args.tg_link.strip().lower().startswith(("tg://webproxy", "https://t.me/webproxy")):
+    if (
+        args.tg_link.strip()
+        .lower()
+        .startswith(("tg://webproxy", "https://t.me/webproxy"))
+    ):
         web_link = parse_web_link(args.tg_link)
         cfg = BridgeConfig(
             listen_host=args.listen_host,

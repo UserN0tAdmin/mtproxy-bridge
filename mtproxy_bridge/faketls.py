@@ -493,9 +493,7 @@ async def _read_exactly_logged(
     try:
         data = await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
     except asyncio.TimeoutError:
-        log.error(
-            f"  [handshake] Timeout reading {what} (need {n} bytes, {timeout}s)"
-        )
+        log.error(f"  [handshake] Timeout reading {what} (need {n} bytes, {timeout}s)")
         raise ConnectionError(f"Timeout reading {what}")
     except asyncio.IncompleteReadError as e:
         log.error(
@@ -586,11 +584,15 @@ async def async_faketls_handshake(
             f"  [handshake] ServerHello body does not start with 0x02: "
             f"{sh_body[0] if sh_body else 'empty'}"
         )
-        raise ConnectionError("ServerHello body does not start with 0x02 (not a ServerHello)")
+        raise ConnectionError(
+            "ServerHello body does not start with 0x02 (not a ServerHello)"
+        )
     log.debug("  [handshake] ServerHello body OK (type=0x02)")
 
     # Шаг 4: CCS + начало AppData (второй prefix из wait_hello_response, 9 байт) + 2 байта длины
-    log.debug("  [handshake] Waiting for CCS+AppData header (second prefix, 9 bytes)...")
+    log.debug(
+        "  [handshake] Waiting for CCS+AppData header (second prefix, 9 bytes)..."
+    )
     ccs_appdata_prefix = await _read_exactly_logged(
         reader, len(_CCS_APPDATA_PREFIX), "CCS+AppData header"
     )
@@ -622,7 +624,9 @@ async def async_faketls_handshake(
 
     # Шаг 5: AppData body
     if appdata_body_len > 0:
-        log.debug(f"  [handshake] Waiting for AppData body ({appdata_body_len} bytes)...")
+        log.debug(
+            f"  [handshake] Waiting for AppData body ({appdata_body_len} bytes)..."
+        )
         appdata_body = await _read_exactly_logged(
             reader, appdata_body_len, "AppData body"
         )
@@ -639,10 +643,7 @@ async def async_faketls_handshake(
     )
     log.debug(f"  [handshake] Server full response: {len(server_full_response)} bytes")
 
-    if (
-        len(server_full_response)
-        < _SERVER_HELLO_DIGEST_POSITION + _HELLO_DIGEST_LENGTH
-    ):
+    if len(server_full_response) < _SERVER_HELLO_DIGEST_POSITION + _HELLO_DIGEST_LENGTH:
         log.error(
             f"  [handshake] Server response too short for digest: "
             f"{len(server_full_response)} bytes"

@@ -99,9 +99,7 @@ class WebStream:
                 if self._error is not None:
                     raise self._error
                 if self._eof:
-                    raise ConnectionError(
-                        f"stream {self.stream_id} is closed"
-                    )
+                    raise ConnectionError(f"stream {self.stream_id} is closed")
                 self._credit_event.clear()
                 if self._credit < size:
                     await self._credit_event.wait()
@@ -288,8 +286,9 @@ class WebTunnel:
             raise ConnectionError(f"stream {stream_id} is already closed")
         carrier = self._require_carrier()
         try:
-            await carrier.enqueue(f.encode(f.FrameType.DATA, stream_id, data),
-                                  lane_id=stream_id)
+            await carrier.enqueue(
+                f.encode(f.FrameType.DATA, stream_id, data), lane_id=stream_id
+            )
         except CarrierFailure as exc:
             raise ConnectionError("web session lost") from exc
 
@@ -337,12 +336,9 @@ class WebTunnel:
             if stream is None:
                 continue  # поздний фрейм закрытого потока (tombstone)
             if ftype is f.FrameType.DATA:
-                if stream._unacked_rx + len(frame.payload) > (
-                    f.INITIAL_STREAM_WINDOW
-                ):
+                if stream._unacked_rx + len(frame.payload) > (f.INITIAL_STREAM_WINDOW):
                     await self._kill_session(
-                        f"relay exceeded receive window on stream "
-                        f"{frame.stream_id}"
+                        f"relay exceeded receive window on stream {frame.stream_id}"
                     )
                     return
                 stream._feed(frame.payload)
@@ -455,14 +451,10 @@ class WebTunnel:
         page = await fetch_bridge_page(self._api, self._link.capability)
         # Фрейм (кусок + заголовок) обязан влезать в batch_limit релея;
         # нижняя граница — защита от бессмысленных значений.
-        self._data_chunk = max(
-            min(f.DATA_CHUNK, page.batch_limit - f.HEADER_SIZE), 1
-        )
+        self._data_chunk = max(min(f.DATA_CHUNK, page.batch_limit - f.HEADER_SIZE), 1)
         resp = await self._api.create_session(page.token, f.hello_frame())
         if resp.status != 200:
-            raise BootstrapRejected(
-                f"session creation rejected: HTTP {resp.status}"
-            )
+            raise BootstrapRejected(f"session creation rejected: HTTP {resp.status}")
         token = resp.headers.get("X-Session-Token")
         if not token:
             raise ProtocolViolation("missing X-Session-Token header")
@@ -502,8 +494,7 @@ class WebTunnel:
         self._carrier_mode = announced_mode
         self._next_stream_id = 1
         log.info(
-            "[web-tunnel] web session established via %s "
-            "(mode=%s, batch_limit=%d)",
+            "[web-tunnel] web session established via %s (mode=%s, batch_limit=%d)",
             self._origin,
             announced_mode,
             page.batch_limit,

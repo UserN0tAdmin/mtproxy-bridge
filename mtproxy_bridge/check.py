@@ -62,8 +62,8 @@ from .utils import log
 # ============================================================================
 
 _REQ_PQ_MULTI_ID = 0xBE7E8EF1  # req_pq_multi#be7e8ef1 nonce:int128 = ResPQ
-_RESPQ_ID = 0x05162463         # resPQ#05162463 nonce server_nonce pq fingerprints
-_RPC_RESULT_ID = 0xF35C6D01    # rpc_result#f35c6d01 req_msg_id result:Object
+_RESPQ_ID = 0x05162463  # resPQ#05162463 nonce server_nonce pq fingerprints
+_RPC_RESULT_ID = 0xF35C6D01  # rpc_result#f35c6d01 req_msg_id result:Object
 _BAD_MSG_NOTIFICATION_ID = 0xA7EFF811
 
 # Статический msg_id ровно как в TDLib PingConnectionReqPQ (MessageId(1)):
@@ -208,7 +208,11 @@ def frame_payload(tag: bytes, payload: bytes) -> bytes:
     if tag == TAG_PADDED_INTERMEDIATE:
         # VersionD::finalizePacket: uint32 LE = payload + паддинг 0..15 байт.
         pad_len = secrets.randbelow(16)
-        return struct.pack("<I", len(payload) + pad_len) + payload + secrets.token_bytes(pad_len)
+        return (
+            struct.pack("<I", len(payload) + pad_len)
+            + payload
+            + secrets.token_bytes(pad_len)
+        )
     # Version0::finalizePacket: ints < 0x7F → 1 байт; иначе 0x7F + 3 байта LE.
     if ints < 0x7F:
         return bytes([ints]) + payload
@@ -293,9 +297,9 @@ def build_req_pq_multi(nonce: bytes) -> bytes:
 class _ResponseVerdict(NamedTuple):
     """Итог разбора одного сообщения-ответа DC (см. :func:`parse_response`)."""
 
-    ok: bool                   # True только для resPQ с эхом нашего nonce
+    ok: bool  # True только для resPQ с эхом нашего nonce
     mtproto_error: int | None  # числовой код ошибки DC (-404 и т.п.)
-    retry: bool                # nop/quick-ack: «ещё не ответ», читать дальше
+    retry: bool  # nop/quick-ack: «ещё не ответ», читать дальше
     detail: str
 
 
@@ -418,9 +422,13 @@ async def _ping_exchange(
             try:
                 chunk = await asyncio.wait_for(recv_chunk(), timeout=budget)
             except asyncio.TimeoutError as e:
-                raise _CheckError("ping", "timed out waiting for MTProto response") from e
+                raise _CheckError(
+                    "ping", "timed out waiting for MTProto response"
+                ) from e
             except (ConnectionError, OSError) as e:
-                raise _CheckError("ping", f"connection dropped while reading response: {e}") from e
+                raise _CheckError(
+                    "ping", f"connection dropped while reading response: {e}"
+                ) from e
             if not chunk:
                 raise _CheckError("ping", "connection closed before MTProto response")
             framer.feed(keys_decryptor.update(chunk))
@@ -488,8 +496,12 @@ async def _run_direct(
             try:
                 await asyncio.wait_for(
                     async_faketls_handshake(
-                        reader, writer, link.domain, link.secret_key,
-                        use_block_m=use_block_m, use_block_e=use_block_e,
+                        reader,
+                        writer,
+                        link.domain,
+                        link.secret_key,
+                        use_block_m=use_block_m,
+                        use_block_e=use_block_e,
                     ),
                     timeout=max(deadline - loop.time(), 0.1),
                 )
@@ -558,7 +570,7 @@ async def _run_web(
     except ImportError as e:
         raise _CheckError(
             "session",
-            'WEB proxy mode requires the [web] extra: '
+            "WEB proxy mode requires the [web] extra: "
             'pip install "mtproxy-bridge[web]"',
         ) from e
 
@@ -656,9 +668,7 @@ async def check_link(
         :class:`CheckResult` with stages, timings and failure reason.
     """
     started = time.monotonic()
-    is_web = link.strip().lower().startswith(
-        ("tg://webproxy", "https://t.me/webproxy")
-    )
+    is_web = link.strip().lower().startswith(("tg://webproxy", "https://t.me/webproxy"))
 
     parse_error: str | None = None
     parsed_link: ProxyLink | WebProxyLink | None = None
@@ -697,14 +707,20 @@ async def check_link(
     try:
         if is_web:
             await _run_web(
-                parsed_link, collector,  # type: ignore[arg-type]
-                dc_id=dc_id, timeout=timeout, web_origin=web_origin,
+                parsed_link,
+                collector,  # type: ignore[arg-type]
+                dc_id=dc_id,
+                timeout=timeout,
+                web_origin=web_origin,
             )
         else:
             await _run_direct(
-                parsed_link, collector,  # type: ignore[arg-type]
-                dc_id=dc_id, timeout=timeout,
-                send_ccs=send_ccs, use_block_m=use_block_m,
+                parsed_link,
+                collector,  # type: ignore[arg-type]
+                dc_id=dc_id,
+                timeout=timeout,
+                send_ccs=send_ccs,
+                use_block_m=use_block_m,
                 use_block_e=use_block_e,
             )
     except asyncio.CancelledError:

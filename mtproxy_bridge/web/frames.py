@@ -116,9 +116,7 @@ def parse_batch(
         stream_id = int.from_bytes(data[offset + 1 : offset + 4], "big")
         (length,) = struct.unpack_from(">I", data, offset + 4)
         if length > max_payload:
-            raise FrameError(
-                f"frame payload {length} exceeds limit {max_payload}"
-            )
+            raise FrameError(f"frame payload {length} exceeds limit {max_payload}")
         end = offset + HEADER_SIZE + length
         if end > total:
             raise FrameError("truncated frame payload")
@@ -206,6 +204,4 @@ def validate_relay_frame(frame: Frame) -> None:
     if frame.type is FrameType.WINDOW:
         parse_window_amount(frame.payload)  # бросит при неверной форме
         return
-    raise FrameError(
-        f"frame type 0x{int(frame.type):02x} is invalid relay-to-client"
-    )
+    raise FrameError(f"frame type 0x{int(frame.type):02x} is invalid relay-to-client")

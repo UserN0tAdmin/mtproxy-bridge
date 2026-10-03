@@ -174,14 +174,10 @@ async def _handle_client(
                 writer.close()
                 return
             except Exception as e:
-                log.error(
-                    f"[client {client_addr}] WEB stream open failed: {e}"
-                )
+                log.error(f"[client {client_addr}] WEB stream open failed: {e}")
                 writer.close()
                 return
-            log.info(
-                f"[client {client_addr}] WEB stream {stream.stream_id} opened"
-            )
+            log.info(f"[client {client_addr}] WEB stream {stream.stream_id} opened")
         else:
             try:
                 log.info(
@@ -189,9 +185,7 @@ async def _handle_client(
                 )
                 try:
                     upstream_reader, upstream_writer = await asyncio.wait_for(
-                        asyncio.open_connection(
-                            cfg.upstream_host, cfg.upstream_port
-                        ),
+                        asyncio.open_connection(cfg.upstream_host, cfg.upstream_port),
                         timeout=UPSTREAM_CONNECT_TIMEOUT_SECS,
                     )
                 except asyncio.TimeoutError:
@@ -200,7 +194,9 @@ async def _handle_client(
                         f"to {cfg.upstream_host}:{cfg.upstream_port}"
                     )
                 _apply_tcp_tuning(upstream_writer, client_addr)
-                log.info(f"[client {client_addr}] TCP connection to upstream established")
+                log.info(
+                    f"[client {client_addr}] TCP connection to upstream established"
+                )
             except OSError as e:
                 log.error(f"[client {client_addr}] Failed to connect to upstream: {e}")
                 writer.close()
@@ -215,8 +211,12 @@ async def _handle_client(
             elif cfg.is_fake_tls:
                 log.info(f"[client {client_addr}] Starting FakeTLS handshake...")
                 server_initial_appdata = await async_faketls_handshake(
-                    upstream_reader, upstream_writer, cfg.domain, cfg.secret_key,
-                    use_block_m=cfg.use_block_m, use_block_e=cfg.use_block_e,
+                    upstream_reader,
+                    upstream_writer,
+                    cfg.domain,
+                    cfg.secret_key,
+                    use_block_m=cfg.use_block_m,
+                    use_block_e=cfg.use_block_e,
                 )
                 tls_writer = TLSRecordWriter(send_ccs=cfg.send_ccs)
                 log.info(
@@ -269,7 +269,9 @@ async def _handle_client(
             writer.close()
             return
 
-        unwrapper = TLSRecordUnwrapper() if (cfg.is_fake_tls and stream is None) else None
+        unwrapper = (
+            TLSRecordUnwrapper() if (cfg.is_fake_tls and stream is None) else None
+        )
 
         # server_initial_appdata — это AppData-body из FakeTLS handshake
         # (HMAC-верификация), НЕ obfuscated2 данные. TDLib также не
@@ -338,7 +340,9 @@ async def _handle_client(
                         break
                     enc = keys.encryptor.update(data)
                     await send_upstream(enc)
-                    log.debug(f"[client {client_addr}] client->upstream: {len(data)} bytes")
+                    log.debug(
+                        f"[client {client_addr}] client->upstream: {len(data)} bytes"
+                    )
             except (ConnectionResetError, BrokenPipeError) as e:
                 log.debug(f"[client {client_addr}] client->upstream: {e}")
             except Exception as e:
@@ -391,7 +395,9 @@ async def _handle_client(
             client_to_upstream(), upstream_to_client(), return_exceptions=True
         )
     except asyncio.CancelledError:
-        log.info(f"[client {client_addr}] Connection interrupted (server shutting down)")
+        log.info(
+            f"[client {client_addr}] Connection interrupted (server shutting down)"
+        )
         raise
     finally:
         log.info(f"[client {client_addr}] Connection closed")

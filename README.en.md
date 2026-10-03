@@ -92,6 +92,7 @@ API_ID = 1234567
 API_HASH = "123456789abcdefgh"
 MTPROXY = "https://t.me/proxy?server=...&port=...&secret=..."
 
+
 async def create_client(proxy_url: str | None) -> Client | None:
     kwargs: dict[str, Any] = {
         "api_id": API_ID,
@@ -100,13 +101,22 @@ async def create_client(proxy_url: str | None) -> Client | None:
     if proxy_url and is_mtproto_link(proxy_url):
         try:
             port = await start_local_bridge(proxy_url)
-            transport = TCPIntermediatePadded if needs_padded_transport(proxy_url) else TCPAbridged
-            kwargs["proxy"] = {"scheme": "socks5", "hostname": "127.0.0.1", "port": port}
+            transport = (
+                TCPIntermediatePadded
+                if needs_padded_transport(proxy_url)
+                else TCPAbridged
+            )
+            kwargs["proxy"] = {
+                "scheme": "socks5",
+                "hostname": "127.0.0.1",
+                "port": port,
+            }
             kwargs["protocol_factory"] = transport
         except Exception as e:
             print(f"The bridge could not be raised: {e}")
             return None
     return Client("my_account", **kwargs)
+
 
 async def main() -> None:
     app = await create_client(MTPROXY)
@@ -116,9 +126,9 @@ async def main() -> None:
         chat = await app.get_chat("https://t.me/durov")
         print(chat)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
-    
 ```
 
 An invalid link or secret raises `ValueError`; wrap the call in `try/except`, as in the example above. To shut down the bridges (e.g., from your own `SIGINT`/`SIGTERM` handler), call `stop_all_bridges()`.
@@ -128,7 +138,9 @@ An invalid link or secret raises `ValueError`; wrap the call in `try/except`, as
 The example works unchanged if you put a WEB link into `MTPROXY`:
 
 ```python
-MTPROXY = "tg://webproxy?server=proxy.example.com&secret=dd0123456789abcdef0123456789abcdef"
+MTPROXY = (
+    "tg://webproxy?server=proxy.example.com&secret=dd0123456789abcdef0123456789abcdef"
+)
 ```
 
 
@@ -144,18 +156,18 @@ The library function performs a full MTProto ping: a real `req_pq_multi` is sent
 ```python
 from mtproxy_bridge import check_link, check_link_sync
 
-result = await check_link(MTPROXY, timeout=15.0)   # from a coroutine
+result = await check_link(MTPROXY, timeout=15.0)  # from a coroutine
 # result = check_link_sync(MTPROXY)                # from sync code
 
 if result.ok:
     print(f"alive, ping {result.rtt_ms:.0f} ms")
-    if result.carrier:                              # WEB mode only
+    if result.carrier:  # WEB mode only
         print(f"carrier: {result.carrier}")
 else:
     print(f"dead at stage {result.stage}: {result.error}")
-    if result.mtproto_error:                        # e.g. -404
+    if result.mtproto_error:  # e.g. -404
         ...
-print(result.to_json(indent=2))                     # machine-readable form
+print(result.to_json(indent=2))  # machine-readable form
 ```
 
 The same via the CLI (exit code 0 = alive, 1 = dead):

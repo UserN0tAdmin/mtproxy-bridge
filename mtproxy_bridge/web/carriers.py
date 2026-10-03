@@ -123,9 +123,7 @@ def pack_batch(
         if count == 0:
             if whole and fr == 1 and len(payload) > batch_limit:
                 # Резать нечего: одиночный фрейм крупнее лимита — падаем сразу.
-                raise FrameError(
-                    f"frame of {len(payload)} bytes exceeds batch limit"
-                )
+                raise FrameError(f"frame of {len(payload)} bytes exceeds batch limit")
             if not whole:
                 head = payload[:nb]
                 queue[0] = payload[nb:]
@@ -263,9 +261,7 @@ class BaseCarrier:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, grace)
         while (
-            self._failed_exc is None
-            and self._has_pending()
-            and loop.time() < deadline
+            self._failed_exc is None and self._has_pending() and loop.time() < deadline
         ):
             await asyncio.sleep(0.02)
         self._stopping = True
@@ -476,8 +472,9 @@ class LaneBasedCarrier(BaseCarrier):
         lane = self._lanes.get(lane_id)
         if lane is None or lane.closed:
             # Поздние фреймы закрытого лейна отбрасываем (семантика tombstone).
-            log.debug("[web-carrier %s] drop late frame(s) for lane %d",
-                      self.mode, lane_id)
+            log.debug(
+                "[web-carrier %s] drop late frame(s) for lane %d", self.mode, lane_id
+            )
             return
         while True:
             if self._stopping:
@@ -486,8 +483,11 @@ class LaneBasedCarrier(BaseCarrier):
             # сравнение не даёт протечь счётчикам в мёртвый объект.
             live = self._lanes.get(lane_id)
             if live is not lane or lane.closed:
-                log.debug("[web-carrier %s] drop late frame(s) for lane %d",
-                          self.mode, lane_id)
+                log.debug(
+                    "[web-carrier %s] drop late frame(s) for lane %d",
+                    self.mode,
+                    lane_id,
+                )
                 return
             if not (
                 self._queued_bytes + len(payload) > UPLINK_QUEUE_BYTES
@@ -577,8 +577,9 @@ class HttpsLanesCarrier(LaneBasedCarrier):
         # Даунклинк-поллер добавит сам sender после первого ack (см. ниже).
         lane.tasks.append(
             asyncio.create_task(
-                self._guarded(f"lane {lane.lane_id} uplink",
-                              lambda ln=lane: self._lane_sender(ln))
+                self._guarded(
+                    f"lane {lane.lane_id} uplink", lambda ln=lane: self._lane_sender(ln)
+                )
             )
         )
 
@@ -588,9 +589,7 @@ class HttpsLanesCarrier(LaneBasedCarrier):
             if packed is None:
                 return
             body, nbytes, count = packed
-            await self._api.up(
-                self._token, lane.sequence, body, lane_id=lane.lane_id
-            )
+            await self._api.up(self._token, lane.sequence, body, lane_id=lane.lane_id)
             lane.sequence += 1
             lane.bytes -= nbytes
             lane.items -= count
@@ -633,14 +632,16 @@ class WsLanesCarrier(LaneBasedCarrier):
     def _spawn_lane_transport(self, lane: _LaneState) -> None:
         lane.tasks.append(
             asyncio.create_task(
-                self._guarded(f"lane {lane.lane_id} socket",
-                              lambda ln=lane: self._lane_socket(ln))
+                self._guarded(
+                    f"lane {lane.lane_id} socket", lambda ln=lane: self._lane_socket(ln)
+                )
             )
         )
         lane.tasks.append(
             asyncio.create_task(
-                self._guarded(f"lane {lane.lane_id} writer",
-                              lambda ln=lane: self._lane_writer(ln))
+                self._guarded(
+                    f"lane {lane.lane_id} writer", lambda ln=lane: self._lane_writer(ln)
+                )
             )
         )
 

@@ -66,9 +66,7 @@ def _make_connection_tracker(
     def _client_connected(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        task = asyncio.create_task(
-            _handle_client(reader, writer, cfg, web_tunnel)
-        )
+        task = asyncio.create_task(_handle_client(reader, writer, cfg, web_tunnel))
 
         def _on_done(t: asyncio.Task) -> None:
             active.discard(t)
@@ -159,9 +157,7 @@ def _install_shutdown_handler(stop_event: asyncio.Event) -> None:
         signal.signal(signal.SIGINT, _sync_handler)
 
 
-async def run_bridge(
-    cfg: BridgeConfig, *, web_tunnel: WebTunnel | None = None
-) -> None:
+async def run_bridge(cfg: BridgeConfig, *, web_tunnel: WebTunnel | None = None) -> None:
     """Start a blocking SOCKS5 server (CLI mode).
 
     Runs until SIGINT/SIGTERM, then shuts down gracefully: stops accepting
@@ -172,9 +168,7 @@ async def run_bridge(
     stop_event = asyncio.Event()
     _install_shutdown_handler(stop_event)
 
-    client_connected_cb, active_connections = _make_connection_tracker(
-        cfg, web_tunnel
-    )
+    client_connected_cb, active_connections = _make_connection_tracker(cfg, web_tunnel)
     server = await asyncio.start_server(
         client_connected_cb, cfg.listen_host, cfg.listen_port
     )
@@ -187,13 +181,12 @@ async def run_bridge(
             else f"unknown ({cfg.expected_tag.hex()})"
         )
     )
-    print(f"SOCKS5 bridge listening on \n\nsocks5://{cfg.listen_host}:{cfg.listen_port}\n")
+    print(
+        f"SOCKS5 bridge listening on \n\nsocks5://{cfg.listen_host}:{cfg.listen_port}\n"
+    )
     if cfg.web_link is not None:
         secret_mode = "dd (random padding)" if cfg.web_link.is_padded else "plain"
-        print(
-            f"WEB proxy tunnel via {cfg.web_link.origin} "
-            f"(secret={secret_mode})"
-        )
+        print(f"WEB proxy tunnel via {cfg.web_link.origin} (secret={secret_mode})")
     else:
         print(
             f"tunnel to {cfg.upstream_host}:{cfg.upstream_port} "
@@ -304,17 +297,21 @@ async def start_local_bridge(
         The actual port the bridge is listening on.
     """
     cfg = _build_bridge_config(
-        tg_link, listen_host, listen_port, dc_id_override,
-        send_ccs, use_block_m, use_block_e, web_origin,
+        tg_link,
+        listen_host,
+        listen_port,
+        dc_id_override,
+        send_ccs,
+        use_block_m,
+        use_block_e,
+        web_origin,
     )
     tunnel: WebTunnel | None = None
     if cfg.web_link is not None:
         from .web.tunnel import WebTunnel
 
         tunnel = WebTunnel(cfg.web_link, origin=cfg.web_origin)
-    client_connected_cb, active_connections = _make_connection_tracker(
-        cfg, tunnel
-    )
+    client_connected_cb, active_connections = _make_connection_tracker(cfg, tunnel)
     server = await asyncio.start_server(client_connected_cb, listen_host, listen_port)
     actual_port = server.sockets[0].getsockname()[1]
 

@@ -108,9 +108,7 @@ class TestParseWebLink:
 class TestHostnameNormalization:
     def test_unicode_host_idna_encoded(self):
         # Кириллический домен → A-label; capability обязан считаться от A-label.
-        parsed = parse_web_link(
-            f"tg://webproxy?server=прокси.рф&secret={PLAIN_HEX}"
-        )
+        parsed = parse_web_link(f"tg://webproxy?server=прокси.рф&secret={PLAIN_HEX}")
         assert parsed.host.startswith("xn--")
         assert parsed.capability == derive_web_capability(
             parsed.host, bytes.fromhex(PLAIN_HEX)
@@ -155,13 +153,8 @@ class TestLinkDetectors:
         assert needs_padded_transport(plain) is False
 
     def test_classic_links_still_work(self):
-        classic_dd = (
-            "tg://proxy?server=1.2.3.4&port=443&secret="
-            + DD_HEX
-        )
-        classic_plain = (
-            "tg://proxy?server=1.2.3.4&port=443&secret=" + PLAIN_HEX
-        )
+        classic_dd = "tg://proxy?server=1.2.3.4&port=443&secret=" + DD_HEX
+        classic_plain = "tg://proxy?server=1.2.3.4&port=443&secret=" + PLAIN_HEX
         assert needs_padded_transport(classic_dd) is True
         assert needs_padded_transport(classic_plain) is False
         assert len(parse_tg_link(classic_plain).secret_key) == 16
@@ -207,9 +200,7 @@ class TestWebLinkWithPath:
         )
         parsed = parse_web_link(link)
         assert parsed.capability == expected
-        assert derive_web_capability(
-            self.PATH_HOST, secret, self.PATH
-        ) == expected
+        assert derive_web_capability(self.PATH_HOST, secret, self.PATH) == expected
 
     def test_plain_marked_secret(self):
         link = (
@@ -223,10 +214,7 @@ class TestWebLinkWithPath:
 
     def test_path_without_marker_rejected(self):
         for secret in (self.KEY_HEX, self.DD_KEY_HEX):
-            link = (
-                f"tg://webproxy?server={self.PATH_HOST}/{self.PATH}"
-                f"&secret={secret}"
-            )
+            link = f"tg://webproxy?server={self.PATH_HOST}/{self.PATH}&secret={secret}"
             with pytest.raises(ValueError, match="marked secret"):
                 parse_web_link(link)
 
@@ -238,9 +226,7 @@ class TestWebLinkWithPath:
                 parse_web_link(link)
 
     def test_root_link_unchanged(self):
-        parsed = parse_web_link(
-            f"tg://webproxy?server={HOST}&secret={PLAIN_HEX}"
-        )
+        parsed = parse_web_link(f"tg://webproxy?server={HOST}&secret={PLAIN_HEX}")
         assert parsed.path == ""
         assert parsed.origin == f"https://{HOST}"
         assert parsed.capability == CAP_PLAIN
@@ -259,9 +245,10 @@ class TestBasePathOfficialVectors:
         )
 
     def test_v2_dd_vector(self):
-        assert derive_web_capability(
-            self.H, b"\xdd" + self.PLAIN, self.P
-        ) == "TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo"
+        assert (
+            derive_web_capability(self.H, b"\xdd" + self.PLAIN, self.P)
+            == "TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo"
+        )
 
     def test_link_end_to_end_matches_vector(self):
         marked = (
@@ -272,18 +259,14 @@ class TestBasePathOfficialVectors:
         parsed = parse_web_link(
             f"tg://webproxy?server={self.H}%2F{self.P}&secret={marked}"
         )
-        assert parsed.capability == (
-            "TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo"
-        )
+        assert parsed.capability == ("TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo")
 
     def test_documented_marked_secret_example(self):
         parsed = parse_web_link(
             "tg://webproxy?server=example.com%2Fphcf2vfe7zgbrslg"
             "&secret=cIVhlEBk_HMMv6RHNWLY7Fk"
         )
-        assert parsed.secret == bytes.fromhex(
-            "8561944064fc730cbfa4473562d8ec59"
-        )
+        assert parsed.secret == bytes.fromhex("8561944064fc730cbfa4473562d8ec59")
 
     def test_path_is_case_sensitive(self):
         marked = "cIVhlEBk_HMMv6RHNWLY7Fk"

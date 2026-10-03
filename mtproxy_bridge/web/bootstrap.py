@@ -65,9 +65,7 @@ from .http_api import BootstrapRejected, WebApi
 DEFAULT_BATCH_LIMIT = 2 * 1024 * 1024
 MAX_BATCH_LIMIT = 2 * 1024 * 1024  # потолок desktop-клиента (loopback fallback)
 
-CARRIER_MODES = frozenset(
-    {"https", "https-lanes", "websocket", "websocket-lanes"}
-)
+CARRIER_MODES = frozenset({"https", "https-lanes", "websocket", "websocket-lanes"})
 
 # Предпочтительный порядок при разборе carrierCapabilities (новый формат).
 PREFERRED_CARRIER_ORDER = (
@@ -190,8 +188,6 @@ async def fetch_bridge_page(api: WebApi, capability: str) -> BridgePage:
     """
     resp = await api.get_bridge_page(capability)
     if resp.status != 200 or not resp.body:
-        raise BootstrapRejected(
-            f"bridge page request failed: HTTP {resp.status}"
-        )
+        raise BootstrapRejected(f"bridge page request failed: HTTP {resp.status}")
     html = resp.body.decode("utf-8", errors="replace")
     return parse_bridge_page(html)

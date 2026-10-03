@@ -94,6 +94,7 @@ API_ID = 1234567
 API_HASH = "123456789abcdefgh"
 MTPROXY = "https://t.me/proxy?server=...&port=...&secret=..."
 
+
 async def create_client(proxy_url: str | None) -> Client | None:
     kwargs: dict[str, Any] = {
         "api_id": API_ID,
@@ -102,13 +103,22 @@ async def create_client(proxy_url: str | None) -> Client | None:
     if proxy_url and is_mtproto_link(proxy_url):
         try:
             port = await start_local_bridge(proxy_url)
-            transport = TCPIntermediatePadded if needs_padded_transport(proxy_url) else TCPAbridged
-            kwargs["proxy"] = {"scheme": "socks5", "hostname": "127.0.0.1", "port": port}
+            transport = (
+                TCPIntermediatePadded
+                if needs_padded_transport(proxy_url)
+                else TCPAbridged
+            )
+            kwargs["proxy"] = {
+                "scheme": "socks5",
+                "hostname": "127.0.0.1",
+                "port": port,
+            }
             kwargs["protocol_factory"] = transport
         except Exception as e:
             print(f"Не удалось поднять мост: {e}")
             return None
     return Client("my_account", **kwargs)
+
 
 async def main() -> None:
     app = await create_client(MTPROXY)
@@ -118,9 +128,9 @@ async def main() -> None:
         chat = await app.get_chat("https://t.me/durov")
         print(chat)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
-    
 ```
 
 Невалидная ссылка или secret — `ValueError`; вызов стоит оборачивать в `try/except`, как в примере. Чтобы погасить мосты (например, в своём обработчике `SIGINT`/`SIGTERM`), вызовите `stop_all_bridges()`.
@@ -130,7 +140,9 @@ if __name__ == "__main__":
 Пример работает без изменений, если в `MTPROXY` подставить WEB-ссылку:
 
 ```python
-MTPROXY = "tg://webproxy?server=proxy.example.com&secret=dd0123456789abcdef0123456789abcdef"
+MTPROXY = (
+    "tg://webproxy?server=proxy.example.com&secret=dd0123456789abcdef0123456789abcdef"
+)
 ```
 
 Мост сам выведет bridge-capability (HMAC-SHA256 от hostname+секрета), получит bootstrap со страницы релея, создаст сессию и выберет carrier-режим, объявленный сервером (`https`, `https-lanes`, `websocket`, `websocket-lanes`). При смерти carrier-сессии она пересоздаётся лениво при следующем соединении клиента.
@@ -144,18 +156,18 @@ MTPROXY = "tg://webproxy?server=proxy.example.com&secret=dd0123456789abcdef01234
 ```python
 from mtproxy_bridge import check_link, check_link_sync
 
-result = await check_link(MTPROXY, timeout=15.0)   # из корутины
+result = await check_link(MTPROXY, timeout=15.0)  # из корутины
 # result = check_link_sync(MTPROXY)                # из синхронного кода
 
 if result.ok:
     print(f"живой, ping {result.rtt_ms:.0f} мс")
-    if result.carrier:                              # только WEB-режим
+    if result.carrier:  # только WEB-режим
         print(f"carrier: {result.carrier}")
 else:
     print(f"мертв на стадии {result.stage}: {result.error}")
-    if result.mtproto_error:                        # например -404
+    if result.mtproto_error:  # например -404
         ...
-print(result.to_json(indent=2))                     # машиночитаемый вид
+print(result.to_json(indent=2))  # машиночитаемый вид
 ```
 
 То же через CLI (exit-код 0 = живой, 1 = нет):

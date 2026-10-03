@@ -145,9 +145,7 @@ class WebApi:
                 sock_connect=_CONNECT_TIMEOUT_SECS,
                 sock_read=_ATTEMPT_TIMEOUT_SECS,
             )
-            self._session = aiohttp.ClientSession(
-                timeout=timeout, cookie_jar=jar
-            )
+            self._session = aiohttp.ClientSession(timeout=timeout, cookie_jar=jar)
         return self._session
 
     async def ws_connect(self, subprotocol: str) -> aiohttp.ClientWebSocketResponse:

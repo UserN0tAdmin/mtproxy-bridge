@@ -268,9 +268,7 @@ def _validate_web_path(path: str) -> str:
     if (
         not path
         or len(path) > _WEB_PATH_MAX_LENGTH
-        or not all(
-            _WEB_PATH_SEGMENT_RE.fullmatch(seg) for seg in path.split("/")
-        )
+        or not all(_WEB_PATH_SEGMENT_RE.fullmatch(seg) for seg in path.split("/"))
     ):
         raise ValueError(f"Invalid WEB proxy path: {path!r}")
     return path
@@ -298,8 +296,7 @@ def _decode_marked_web_secret(secret_str: str) -> tuple[bytes, bytes]:
         raise ValueError(f"Invalid marked WEB secret: {e}") from e
     if not marked or marked[0] != _WEB_PATH_SECRET_MARKER:
         raise ValueError(
-            "WEB link with a path needs a marked secret: "
-            "first byte must be 0x70"
+            "WEB link with a path needs a marked secret: first byte must be 0x70"
         )
     if base64.urlsafe_b64encode(marked).rstrip(b"=").decode("ascii") != s:
         raise ValueError("Marked WEB secret is not canonical base64url")
@@ -355,9 +352,7 @@ def parse_web_link(link: str) -> WebProxyLink:
     params = parse_qs(parsed.query)
 
     if not params.get("server") or not params.get("secret"):
-        raise ValueError(
-            "Invalid WEB proxy link: server or secret is missing"
-        )
+        raise ValueError("Invalid WEB proxy link: server or secret is missing")
 
     host_raw, has_path, path = params["server"][0].strip().partition("/")
     host = _normalize_web_host(host_raw)

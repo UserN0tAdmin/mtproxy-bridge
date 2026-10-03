@@ -124,8 +124,8 @@ async def test_503_garbage_retry_after_falls_back_to_backoff(monkeypatch):
     result = await _run_down(api, session, monkeypatch, sleeps)
 
     assert result.has_data is False
-    assert len(session.requests) == 2            # повтор после паузы
-    assert len(sleeps) == 1 and sleeps[0] > 0    # backoff, а не крах
+    assert len(session.requests) == 2  # повтор после паузы
+    assert len(sleeps) == 1 and sleeps[0] > 0  # backoff, а не крах
     await api.close()
 
 

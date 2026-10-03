@@ -41,4 +41,3 @@ __all__ = [
     "fetch_bridge_page",
     "parse_bridge_page",
 ]
-

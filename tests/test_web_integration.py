@@ -133,8 +133,7 @@ class MockRelay:
         mtproto_secret: bytes | None = None,
         batch_limit: int = 2 * 1024 * 1024,
     ) -> None:
-        assert carrier_mode in ("https", "https-lanes", "websocket",
-                                "websocket-lanes")
+        assert carrier_mode in ("https", "https-lanes", "websocket", "websocket-lanes")
         self.backend_port = backend_port
         self.carrier_mode = carrier_mode
         self.mtproto_secret = mtproto_secret
@@ -331,7 +330,7 @@ class MockRelay:
             if not sub.startswith(prefix):
                 return web.Response(status=404)
             try:
-                lane_id = int(sub[len(prefix):])
+                lane_id = int(sub[len(prefix) :])
             except ValueError:
                 return web.Response(status=404)
             # lane 0 не существует, повторное использование id запрещено.
@@ -764,9 +763,7 @@ async def tight_batch_relay(request, echo_server):
     """Релей, анонсирующий и соблюдающий ровно нижний кламп batchLimit
     (64 КиБ): полный DATA-кусок по умолчанию (65536 + 8 заголовка) раньше
     превышал такой лимит, и релей отклонял /up, роняя сессию."""
-    mock = MockRelay(
-        echo_server, carrier_mode=request.param, batch_limit=64 * 1024
-    )
+    mock = MockRelay(echo_server, carrier_mode=request.param, batch_limit=64 * 1024)
     runner = web.AppRunner(mock.make_app(), shutdown_timeout=2)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
