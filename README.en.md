@@ -131,6 +131,8 @@ The example works unchanged if you put a WEB link into `MTPROXY`:
 MTPROXY = "tg://webproxy?server=proxy.example.com&secret=dd0123456789abcdef0123456789abcdef"
 ```
 
+
+A relay deployed under a path (`tg://webproxy?server=host/path&secret=...`, an Android client extension) is supported too: the link secret is unpadded base64url of `0x70` + secret (plain or `dd`), the bridge capability uses the context `tdesktop-web-proxy-bridge-v2\n<host>\n<path>`, and the bridge page plus `/api/v1/*` are requested under `https://host/path/`. A path is `/`-separated segments of `[A-Za-z0-9][A-Za-z0-9_-]*`, up to 128 characters.
 The bridge derives the bridge-capability (HMAC-SHA256 over hostname+secret), fetches the bootstrap from the relay's page, creates a session and uses whatever carrier mode the server announces (`https`, `https-lanes`, `websocket`, `websocket-lanes`). If a carrier dies, it is re-established lazily on the next client connection.
 
 For non-standard deployments and tests, `start_local_bridge` accepts `web_origin=` to override the default `https://<host>` origin.

@@ -67,6 +67,8 @@ pip install "mtproxy-bridge[web] @ git+https://github.com/UserN0tAdmin/mtproxy-b
 
 Для WEB Proxy (`tg://webproxy`) поддерживаются только `plain` (16 байт) и `dd`; `ee`/FakeTLS в WEB-режиме не существует.
 
+Релей под путём (`tg://webproxy?server=host/path&secret=...`, расширение клиента Android): секрет в такой ссылке — base64url без паддинга от `0x70` + секрет (`plain` либо `dd`), bridge-capability выводится по контексту `tdesktop-web-proxy-bridge-v2\n<host>\n<path>`, а bridge-страница и `/api/v1/*` запрашиваются под `https://host/path/`. Путь — сегменты `[A-Za-z0-9][A-Za-z0-9_-]*` через `/`, до 128 символов.
+
 ## Использование как библиотека
 
 Основной сценарий — встраивание перед созданием Telegram-клиента. Публичный API:

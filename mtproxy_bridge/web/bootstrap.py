@@ -28,6 +28,10 @@
 
        const relayOrigin="https://H",bootstrap="<token>",carrierMode="<mode>";
 
+   Свежий tproxy-server с base path отдаёт ``relayBase="https://H/P/"``
+   вместо ``relayOrigin``; парсер этих значений не читает — origin
+   (вместе с путём) берётся из ссылки.
+
 2. Старый Telemt (фиксированный carrier)::
 
        const relayOrigin='https://H',bootstrap='<token>',carrier='<mode>';

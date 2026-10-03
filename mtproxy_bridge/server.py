@@ -191,7 +191,7 @@ async def run_bridge(
     if cfg.web_link is not None:
         secret_mode = "dd (random padding)" if cfg.web_link.is_padded else "plain"
         print(
-            f"WEB proxy tunnel via https://{cfg.web_link.host} "
+            f"WEB proxy tunnel via {cfg.web_link.origin} "
             f"(secret={secret_mode})"
         )
     else:

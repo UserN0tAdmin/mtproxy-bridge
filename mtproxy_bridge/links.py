@@ -39,6 +39,17 @@ _MAX_DOMAIN_LENGTH = 182
 # Telegram Desktop.
 _WEB_BRIDGE_LABEL = "tdesktop-web-proxy-bridge-v1"
 
+# WEB-прокси с путём (``server=host/path``): расширение клиента Android.
+# Capability выводится по v2-контексту, а секрет в ссылке «маркируется»:
+# base64url без паддинга от 0x70 + секрет (16 байт либо 0xDD + 16). Маркер
+# нужен, чтобы клиенты без поддержки пути отвергали ссылку, а не молча
+# подключались к корню домена.
+_WEB_BRIDGE_LABEL_V2 = "tdesktop-web-proxy-bridge-v2"
+_WEB_PATH_SECRET_MARKER = 0x70
+_WEB_PATH_MAX_LENGTH = 128
+_WEB_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_WEB_MARKED_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
 # Канонический lowercase ASCII/A-label hostname (PROTOCOL.md: «canonical
 # lowercase ASCII/IDNA hostname»). Каждый label: буквы/цифры, дефисы внутри.
 _HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -177,6 +188,17 @@ class WebProxyLink(NamedTuple):
     secret_key: bytes  # 16-байтный ключ MTProxy без префикса (для obfuscated2)
     is_padded: bool  # dd-режим → клиенту нужен TCPIntermediatePadded
     capability: str  # 43-символьная base64url bridge-capability
+    path: str = ""  # путь релея без крайних «/» (пусто — релей в корне домена)
+
+    @property
+    def address(self) -> str:
+        """``host`` либо ``host/path`` — как в поле ``server`` ссылки."""
+        return f"{self.host}/{self.path}" if self.path else self.host
+
+    @property
+    def origin(self) -> str:
+        """Origin релея; для пути включает его префикс (без «/» в конце)."""
+        return f"https://{self.address}"
 
 
 def _normalize_web_host(host: str) -> str:
@@ -203,25 +225,93 @@ def _normalize_web_host(host: str) -> str:
     return h
 
 
-def derive_web_capability(host: str, secret: bytes) -> str:
+def derive_web_capability(host: str, secret: bytes, path: str = "") -> str:
     """Выводит bridge-capability (PROTOCOL.md, «Bridge URL»).
 
-        context = UTF-8("tdesktop-web-proxy-bridge-v1\\n" + H)
+        v1 (путь пуст):
+            context = UTF-8("tdesktop-web-proxy-bridge-v1\\n" + H)
+        v2 (релей под путём P):
+            context = UTF-8("tdesktop-web-proxy-bridge-v2\\n" + H + "\\n" + P)
         capability = base64url-nopad(HMAC-SHA256(key=S, message=context))
 
     ``secret`` — сырые байты секрета как в ссылке: для dd-режима префикс
     0xDD сохраняется (это подтверждено официальными тестовыми векторами).
+    В v2-режиме ``secret`` — уже расмаркированный (без байта 0x70).
 
     Args:
         host: канонический lowercase ASCII hostname.
         secret: 16 либо 17 (dd-prefixed) байт секрета.
+        path: путь релея без крайних «/» либо пустая строка.
 
     Returns:
         43-символьная canonical unpadded base64url строка.
     """
-    context = (_WEB_BRIDGE_LABEL + "\n" + host).encode("utf-8")
+    if path:
+        context = f"{_WEB_BRIDGE_LABEL_V2}\n{host}\n{path}".encode("utf-8")
+    else:
+        context = f"{_WEB_BRIDGE_LABEL}\n{host}".encode("utf-8")
     digest = hmac.new(secret, context, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _validate_web_path(path: str) -> str:
+    """Проверяет путь WEB-релея (правила клиента Android) и возвращает его.
+
+    Сегменты ``[A-Za-z0-9][A-Za-z0-9_-]*`` через «/», без пустых
+    сегментов (то есть без крайних и двойных слэшей), всего ≤ 128 символов.
+    Регистр сохраняется (в отличие от hostname). Те же правила, что у
+    ``config.ValidateBasePath`` в tproxy-server (BASE_PATH.md §1).
+
+    Raises:
+        ValueError: путь пуст либо не соответствует правилам.
+    """
+    if (
+        not path
+        or len(path) > _WEB_PATH_MAX_LENGTH
+        or not all(
+            _WEB_PATH_SEGMENT_RE.fullmatch(seg) for seg in path.split("/")
+        )
+    ):
+        raise ValueError(f"Invalid WEB proxy path: {path!r}")
+    return path
+
+
+def _decode_marked_web_secret(secret_str: str) -> tuple[bytes, bytes]:
+    """Декодирует маркированный секрет ссылки с путём → ``(raw, key)``.
+
+    Формат: canonical base64url без паддинга от ``0x70 + secret``, где
+    ``secret`` — 16 байт либо ``0xDD`` + 16 байт.
+
+    Raises:
+        ValueError: не base64url, нет маркера 0x70, неверная длина либо
+            неканоническая запись.
+    """
+    s = secret_str.strip()
+    if not _WEB_MARKED_SECRET_RE.fullmatch(s):
+        raise ValueError(
+            "WEB link with a path needs a marked secret: "
+            "base64url(0x70 + secret) without padding"
+        )
+    try:
+        marked = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    except ValueError as e:
+        raise ValueError(f"Invalid marked WEB secret: {e}") from e
+    if not marked or marked[0] != _WEB_PATH_SECRET_MARKER:
+        raise ValueError(
+            "WEB link with a path needs a marked secret: "
+            "first byte must be 0x70"
+        )
+    if base64.urlsafe_b64encode(marked).rstrip(b"=").decode("ascii") != s:
+        raise ValueError("Marked WEB secret is not canonical base64url")
+    inner = marked[1:]
+    if len(inner) == 16:
+        return inner, inner
+    if len(inner) == 17 and inner[0] == 0xDD:
+        return inner, inner[1:]
+    raise ValueError(
+        f"Unrecognized marked WEB secret (inner len={len(inner)}): expected "
+        f"16 bytes (plain) or 17 bytes (0xDD + key)"
+    )
 
 
 def _decode_web_secret(secret_str: str) -> tuple[bytes, bytes]:
@@ -252,11 +342,14 @@ def parse_web_link(link: str) -> WebProxyLink:
     """Parse ``tg://webproxy?server=...&secret=...`` into a :class:`WebProxyLink`.
 
     The port is absent from the link (or equals 443); HTTPS is fixed by
-    the WEB proxy type.
+    the WEB proxy type. ``server`` is a bare hostname, or ``host/path``
+    for a relay deployed under a path (Android client extension); in
+    that case the secret must be the 0x70-marked base64url form and the
+    capability is derived with the v2 context.
 
     Raises:
-        ValueError: server/secret missing, port != 443, invalid hostname,
-            or unsupported secret format.
+        ValueError: server/secret missing, port != 443, invalid hostname
+            or path, or unsupported secret format.
     """
     parsed = urlparse(link.strip())
     params = parse_qs(parsed.query)
@@ -266,7 +359,10 @@ def parse_web_link(link: str) -> WebProxyLink:
             "Invalid WEB proxy link: server or secret is missing"
         )
 
-    host = _normalize_web_host(params["server"][0])
+    host_raw, has_path, path = params["server"][0].strip().partition("/")
+    host = _normalize_web_host(host_raw)
+    if has_path:
+        path = _validate_web_path(path)
 
     if params.get("port"):
         try:
@@ -280,8 +376,11 @@ def parse_web_link(link: str) -> WebProxyLink:
                 f"WEB proxy endpoint is always https on port 443, got {port}"
             )
 
-    secret, key = _decode_web_secret(params["secret"][0])
-    capability = derive_web_capability(host, secret)
+    if has_path:
+        secret, key = _decode_marked_web_secret(params["secret"][0])
+    else:
+        secret, key = _decode_web_secret(params["secret"][0])
+    capability = derive_web_capability(host, secret, path)
     return WebProxyLink(
         host=host,
         port=443,
@@ -289,6 +388,7 @@ def parse_web_link(link: str) -> WebProxyLink:
         secret_key=key,
         is_padded=len(secret) == 17,
         capability=capability,
+        path=path,
     )
 
 

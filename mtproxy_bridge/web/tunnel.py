@@ -170,7 +170,7 @@ class WebTunnel:
 
     def __init__(self, link: WebProxyLink, *, origin: str | None = None) -> None:
         self._link = link
-        self._origin = origin or f"https://{link.host}"
+        self._origin = origin or link.origin
         self._api = WebApi(self._origin)
         self._carrier: BaseCarrier | None = None
         self._session_token = ""

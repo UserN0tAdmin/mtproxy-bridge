@@ -165,3 +165,136 @@ class TestLinkDetectors:
         assert needs_padded_transport(classic_dd) is True
         assert needs_padded_transport(classic_plain) is False
         assert len(parse_tg_link(classic_plain).secret_key) == 16
+
+
+class TestWebLinkWithPath:
+    """WEB-релей под путём (``server=host/path``): v2-capability и 0x70-секрет."""
+
+    PATH_HOST = "wow.shipfasterlabs.com"
+    PATH = "api/stream"
+    KEY_HEX = "f8861a4ae3f60879a73f33afdc4eeccb"
+    DD_KEY_HEX = "dd" + KEY_HEX
+
+    @staticmethod
+    def _mark(secret_hex: str) -> str:
+        raw = b"\x70" + bytes.fromhex(secret_hex)
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    def test_real_world_link_parses(self):
+        link = (
+            "tg://webproxy?server=wow.shipfasterlabs.com%2Fapi%2Fstream"
+            "&secret=cN34hhpK4_YIeac_M6_cTuzL"
+        )
+        parsed = parse_web_link(link)
+        assert parsed.host == self.PATH_HOST
+        assert parsed.path == self.PATH
+        assert parsed.address == f"{self.PATH_HOST}/{self.PATH}"
+        assert parsed.origin == f"https://{self.PATH_HOST}/{self.PATH}"
+        assert parsed.secret == bytes.fromhex(self.DD_KEY_HEX)
+        assert parsed.secret_key == bytes.fromhex(self.KEY_HEX)
+        assert parsed.is_padded is True
+
+    def test_capability_uses_v2_context(self):
+        secret = bytes.fromhex(self.DD_KEY_HEX)
+        context = (
+            f"tdesktop-web-proxy-bridge-v2\n{self.PATH_HOST}\n{self.PATH}"
+        ).encode()
+        digest = hmac.new(secret, context, hashlib.sha256).digest()
+        expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        link = (
+            f"tg://webproxy?server={self.PATH_HOST}/{self.PATH}"
+            f"&secret={self._mark(self.DD_KEY_HEX)}"
+        )
+        parsed = parse_web_link(link)
+        assert parsed.capability == expected
+        assert derive_web_capability(
+            self.PATH_HOST, secret, self.PATH
+        ) == expected
+
+    def test_plain_marked_secret(self):
+        link = (
+            f"tg://webproxy?server={self.PATH_HOST}/a/b"
+            f"&secret={self._mark(self.KEY_HEX)}"
+        )
+        parsed = parse_web_link(link)
+        assert parsed.path == "a/b"
+        assert parsed.is_padded is False
+        assert parsed.secret == bytes.fromhex(self.KEY_HEX)
+
+    def test_path_without_marker_rejected(self):
+        for secret in (self.KEY_HEX, self.DD_KEY_HEX):
+            link = (
+                f"tg://webproxy?server={self.PATH_HOST}/{self.PATH}"
+                f"&secret={secret}"
+            )
+            with pytest.raises(ValueError, match="marked secret"):
+                parse_web_link(link)
+
+    def test_invalid_paths_rejected(self):
+        secret = self._mark(self.DD_KEY_HEX)
+        for bad in ("a/", "/a", "a//b", "-a", "a b", "a." + "x", "x" * 129):
+            link = f"tg://webproxy?server={self.PATH_HOST}/{bad}&secret={secret}"
+            with pytest.raises(ValueError, match="path"):
+                parse_web_link(link)
+
+    def test_root_link_unchanged(self):
+        parsed = parse_web_link(
+            f"tg://webproxy?server={HOST}&secret={PLAIN_HEX}"
+        )
+        assert parsed.path == ""
+        assert parsed.origin == f"https://{HOST}"
+        assert parsed.capability == CAP_PLAIN
+
+
+class TestBasePathOfficialVectors:
+    """Векторы и пример из tproxy-server BASE_PATH.md §1 и §3."""
+
+    H = "proxy.example.com"
+    P = "dobry-cola-super-app"
+    PLAIN = bytes.fromhex(PLAIN_HEX)
+
+    def test_v2_plain_vector(self):
+        assert derive_web_capability(self.H, self.PLAIN, self.P) == (
+            "hHz99Xs93EN1j91G9gpNepXwGNNt5YdAFkEVk_LlqdQ"
+        )
+
+    def test_v2_dd_vector(self):
+        assert derive_web_capability(
+            self.H, b"\xdd" + self.PLAIN, self.P
+        ) == "TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo"
+
+    def test_link_end_to_end_matches_vector(self):
+        marked = (
+            base64.urlsafe_b64encode(b"\x70" + b"\xdd" + self.PLAIN)
+            .rstrip(b"=")
+            .decode()
+        )
+        parsed = parse_web_link(
+            f"tg://webproxy?server={self.H}%2F{self.P}&secret={marked}"
+        )
+        assert parsed.capability == (
+            "TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo"
+        )
+
+    def test_documented_marked_secret_example(self):
+        parsed = parse_web_link(
+            "tg://webproxy?server=example.com%2Fphcf2vfe7zgbrslg"
+            "&secret=cIVhlEBk_HMMv6RHNWLY7Fk"
+        )
+        assert parsed.secret == bytes.fromhex(
+            "8561944064fc730cbfa4473562d8ec59"
+        )
+
+    def test_path_is_case_sensitive(self):
+        marked = "cIVhlEBk_HMMv6RHNWLY7Fk"
+        a = parse_web_link(f"tg://webproxy?server=example.com/AbC&secret={marked}")
+        b = parse_web_link(f"tg://webproxy?server=example.com/abc&secret={marked}")
+        assert a.path == "AbC" and b.path == "abc"
+        assert a.capability != b.capability
+
+    def test_newline_inside_path_rejected(self):
+        marked = "cIVhlEBk_HMMv6RHNWLY7Fk"
+        with pytest.raises(ValueError, match="path"):
+            parse_web_link(
+                f"tg://webproxy?server=example.com%2Fabc%0Adef&secret={marked}"
+            )
