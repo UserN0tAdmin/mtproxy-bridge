@@ -694,14 +694,6 @@ class TestActivityTimeout:
             assert await _read_until(reader, 1, 3) == b"k"
         await close_writer(writer)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "relay.py считает ACTIVITY_TIMEOUT_SECS отдельно для каждого направления, "
-            "а config.py обещает «хоть один байт за интервал» (в любом направлении). "
-            "Когда расхождение устранят, тест станет XPASS — снимите маркер."
-        ),
-    )
     async def test_server_push_keeps_a_silent_client_alive(
         self, env_factory, monkeypatch
     ):

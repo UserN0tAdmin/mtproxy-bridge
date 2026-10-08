@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from .config import (
@@ -44,6 +45,53 @@ from .utils import _apply_tcp_tuning, _hex, log
 
 if TYPE_CHECKING:
     from .web.tunnel import WebStream, WebTunnel
+
+
+# ============================================================================
+# Общий idle-дедлайн соединения
+# ============================================================================
+
+
+class _ActivityDeadline:
+    """Дедлайн неактивности, общий для обоих направлений релея.
+
+    Контракт ``config.py``: «хоть один байт за этот интервал, иначе оба
+    направления разрываются» — это уровень соединения, а не отдельного
+    read'а. Поэтому активность любого направления (данные клиента либо
+    ответ/пуш от upstream) отодвигает один дедлайн: пуш-сессия с молчащим
+    клиентом живёт, пока upstream шлёт байты.
+    """
+
+    def __init__(self, timeout: float) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._timeout = timeout
+        self._deadline = self._loop.time() + timeout
+
+    def touch(self) -> None:
+        """Отодвигает дедлайн: по соединению прошёл байт."""
+        self._deadline = self._loop.time() + self._timeout
+
+    def remaining(self) -> float:
+        return self._deadline - self._loop.time()
+
+    async def read(self, read: Callable[[], Awaitable[bytes]]) -> bytes:
+        """Читает данные, отодвигая общий дедлайн активности.
+
+        Бросает :class:`asyncio.TimeoutError` только когда за весь интервал
+        не пришло ни одного байта ни из одного направления. Локальный
+        таймаут ожидания сам по себе ещё не простой: дедлайн мог быть
+        отодвинут другим направлением, поэтому ожидание продолжается.
+        """
+        while True:
+            remaining = self.remaining()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            try:
+                data = await asyncio.wait_for(read(), timeout=remaining)
+            except asyncio.TimeoutError:
+                continue
+            self.touch()
+            return data
 
 
 async def _handle_client(
@@ -286,6 +334,8 @@ async def _handle_client(
         log.info(f"[client {client_addr}] Tunnel established, starting relay")
 
         # --- Адаптеры транспорта (direct TCP или WEB-поток) ----------------
+        idle = _ActivityDeadline(ACTIVITY_TIMEOUT_SECS)
+
         if stream is not None:
 
             async def send_upstream(encrypted: bytes) -> None:
@@ -293,12 +343,7 @@ async def _handle_client(
 
             async def recv_upstream() -> tuple[bytes, bool]:
                 """Возвращает ``(расшифрованные_байты, eof)``."""
-                try:
-                    chunk = await asyncio.wait_for(
-                        stream.read(), timeout=ACTIVITY_TIMEOUT_SECS
-                    )
-                except asyncio.TimeoutError:
-                    raise
+                chunk = await idle.read(stream.read)
                 return chunk, not chunk  # b"" ⇒ CLOSE/EOF потока
 
         else:
@@ -311,9 +356,7 @@ async def _handle_client(
                 await upstream_writer.drain()
 
             async def recv_upstream() -> tuple[bytes, bool]:
-                data = await asyncio.wait_for(
-                    upstream_reader.read(65536), timeout=ACTIVITY_TIMEOUT_SECS
-                )
+                data = await idle.read(lambda: upstream_reader.read(65536))
                 if not data:
                     return b"", True
                 plain_wire = unwrapper.feed(data) if unwrapper else data
@@ -324,9 +367,7 @@ async def _handle_client(
             try:
                 while True:
                     try:
-                        data = await asyncio.wait_for(
-                            reader.read(65536), timeout=ACTIVITY_TIMEOUT_SECS
-                        )
+                        data = await idle.read(lambda: reader.read(65536))
                     except asyncio.TimeoutError:
                         log.warning(
                             f"[client {client_addr}] client->upstream: no activity for "
