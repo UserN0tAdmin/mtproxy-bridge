@@ -255,7 +255,8 @@ class BaseCarrier:
     async def forget_lane(self, lane_id: int) -> None:
         """Локально закрывает транспорт потока (нет-op для плоских)."""
 
-    def _reject_cross_lane(self, batch: bytes, lane_id: int) -> None:
+    @staticmethod
+    def _reject_cross_lane(batch: bytes, lane_id: int) -> None:
         """Отвергает батч, содержащий кадры чужого лейна.
 
         PROTOCOL.md:309-311 — «For a nonzero lane, every frame in an
@@ -268,9 +269,9 @@ class BaseCarrier:
         если тот уже закрыт.
 
         Парсим в carrier'е, а не протягиваем ``lane_id`` в ``_on_inbound``:
-        двойной ``parse_batch`` — линейный скан memoryview на батч ≤2 МиБ,
-        на фоне HTTP round-trip он не измерим, но зато подпись колбэка и
-        внутренняя логика туннеля остаются нетронутыми.
+        дублирующий разбор батча (плюс копии payload'ов) на партии ≤2 МиБ на
+        фоне HTTP round-trip не измерим, но зато подпись колбэка и внутренняя
+        логика туннеля остаются нетронутыми.
 
         Битый батч намеренно пропускаем: формой ответит ``_on_inbound``,
         не дублируя диагностику.
@@ -388,11 +389,17 @@ class BaseCarrier:
     async def _teardown_transport(self) -> None:
         return
 
+    async def _cancel_lanes(self) -> None:
+        """Отдаёт ресурсы лейнов (нет-op для плоских режимов)."""
+
     async def _fail(self, exc: BaseException) -> None:
         if self._failed_exc is not None or self._stopping:
             return
         self._failed_exc = exc
         self._stopping = True
+        # Лейны — до _drop_pending: forget_lane списывает их budget с общего
+        # счётчика, а _drop_pending обнуляет только плоский.
+        await self._cancel_lanes()
         self._drop_pending("carrier failure")
         await self._cancel_tasks()
         await self._teardown_transport()
@@ -671,6 +678,23 @@ class LaneBasedCarrier(BaseCarrier):
         lane.bytes = 0
         lane.items = 0
 
+    async def _cancel_lanes(self) -> None:
+        """Смерть carrier'а — смерть всех его лейнов.
+
+        В lanes-режимах ``self._tasks`` пуст: ``start()`` кладёт задачи
+        только в ``lane.tasks``, поэтому ``_cancel_tasks()`` здесь no-op, а
+        ``_teardown_transport`` закрывает лишь сокеты — у https-lanes его и
+        нет вовсе. Без этого шага lane-таски остаются висеть на
+        ``lane.wake`` уже после отказа carrier'а.
+
+        ``forget_lane`` идемпотентен, поэтому параллельный вход (reader,
+        закрывший свой лейн чуть раньше) безопасен. Ошибка отдельного лейна
+        не должна съесть исходный отказ — глушим по одному.
+        """
+        for lane_id in list(self._lanes):
+            with contextlib.suppress(Exception):
+                await self.forget_lane(lane_id)
+
     def _has_pending(self) -> bool:
         """Есть ли неотправленные аплинк-байты (по всем лейнам)."""
         return bool(self._pending) or any(lane.pending for lane in self._lanes.values())
@@ -819,7 +843,15 @@ class WsLanesCarrier(LaneBasedCarrier):
             # (PROTOCOL.md:390-392: невалидное relay-сообщение на лейне
             # трактуется как parent-carrier failure, а не как сброс потока).
             # Upstream пусть _guarded донесёт это до _fail().
+            #
+            # Лейн-local cleanup — ДО ререйза: finally ниже обнуляет
+            # lane.socket, и _teardown_transport не нашёл бы, что закрывать —
+            # сокет нарушителя пережил бы смерть carrier'а вплоть до aclose()
+            # (инвариант tests/test_ws_lanes_teardown.py). _on_stream_reset
+            # здесь не нужен: carrier умирает, стримы чистит _on_failure.
             established = False
+            with contextlib.suppress(Exception):
+                await self.forget_lane(lane.lane_id)
             raise
         except Exception:
             # Установленный сокет умер — роняем только этот поток.

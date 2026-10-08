@@ -43,7 +43,7 @@ from aiohttp import web
 
 from mtproxy_bridge.links import parse_web_link
 from mtproxy_bridge.web import frames as f
-from mtproxy_bridge.web.carriers import CarrierFailure
+from mtproxy_bridge.web.carriers import CarrierFailure, WsLanesCarrier
 from mtproxy_bridge.web.tunnel import WebTunnel
 
 HOST = "proxy.example.com"
@@ -220,6 +220,23 @@ async def _open_session(relay: _HostileRelay, runner: web.AppRunner) -> WebTunne
     return tunnel
 
 
+async def _wait_for(pred, timeout: float = 2.0) -> bool:
+    """Ждёт истинности ``pred`` — асинхронные последствия отказа carrier'а."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if pred():
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+async def _close(tunnel: WebTunnel | None) -> None:
+    if tunnel is not None:
+        with contextlib.suppress(Exception):
+            await tunnel.aclose()
+
+
 @pytest.mark.parametrize("behaviour", ["text", "empty-binary", "cross-lane"])
 async def test_relay_violation_kills_parent_carrier(behaviour):
     """Невалидное relay-сообщение на лейне — отказ carrier'а, не сброс стрима."""
@@ -241,7 +258,7 @@ async def test_relay_violation_kills_parent_carrier(behaviour):
         )
         assert isinstance(carrier.failed, CarrierFailure)
         # Смерть carrier'а = смерть сессии: открытые стримы сброшены.
-        assert tunnel._streams == {} or all(s.closed for s in tunnel._streams.values())
+        assert tunnel._streams == {}
         if behaviour == "cross-lane":
             # Причина обязана приходить из lane-проверки, а не из общего
             # _kill_session: иначе тест проходил бы и без неё.
@@ -250,6 +267,73 @@ async def test_relay_violation_kills_parent_carrier(behaviour):
         if tunnel is not None:
             with contextlib.suppress(Exception):
                 await tunnel.aclose()
+        await runner.cleanup()
+
+
+@pytest.mark.parametrize("behaviour", ["text", "empty-binary", "cross-lane"])
+async def test_relay_violation_closes_the_offending_lane_socket(behaviour):
+    """Сокет нарушителя закрывается сразу, а не живёт до aclose().
+
+    ``except CarrierFailure`` делает lane-local cleanup до ререйза: иначе
+    ``finally`` уже обнулил бы ``lane.socket``, ``_teardown_transport`` не
+    нашёл бы, что закрывать, и сокет остался бы открыт до закрытия
+    aiohttp-сессии — ровно тот инвариант, который сторожит
+    ``tests/test_ws_lanes_teardown.py``.
+    """
+    relay = _HostileRelay(behaviour, variant="ws-lanes")
+    runner = await _serve(relay)
+    tunnel = None
+    try:
+        tunnel = await _open_session(relay, runner)
+        carrier = tunnel._carrier
+        assert carrier is not None
+
+        for _ in range(200):
+            if carrier.failed is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert isinstance(carrier.failed, CarrierFailure), behaviour
+
+        assert await _wait_for(
+            lambda: relay.sockets and all(w.closed for w in relay.sockets)
+        ), f"{behaviour}: лейн-сокет пережил смерть carrier'а"
+    finally:
+        await _close(tunnel)
+        await runner.cleanup()
+
+
+async def test_https_lanes_failure_reclaims_every_lane():
+    """Отказ carrier'а обязан отдать все лейны, а не только виновный.
+
+    У https-lanes нет сокетов, которые разбудили бы sender'ов: ``lane.wake``
+    их никто не будит, ``self._tasks`` пуст (задачи живут в ``lane.tasks``),
+    поэтому без ``_cancel_lanes`` они остаются висеть уже после отказа.
+    """
+    relay = _HostileRelay("cross-lane", variant="http-lanes")
+    runner = await _serve(relay)
+    tunnel = None
+    try:
+        tunnel = await _open_session(relay, runner)
+        carrier = tunnel._carrier
+        assert carrier is not None
+        assert tunnel.carrier_mode == "https-lanes"
+        lane_tasks = [t for ln in carrier._lanes.values() for t in ln.tasks]
+        assert lane_tasks, "лейны не создались"
+
+        for _ in range(300):
+            if carrier.failed is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert carrier.failed is not None
+        assert "cross-lane" in str(carrier.failed)
+
+        assert await _wait_for(lambda: not carrier._lanes), "лейны не отданы"
+        assert carrier._lanes == {}
+        assert all(t.done() for t in lane_tasks), (
+            "лейн-задачи пережили смерть carrier'а"
+        )
+    finally:
+        await _close(tunnel)
         await runner.cleanup()
 
 
@@ -308,8 +392,7 @@ async def test_correct_lane_frames_pass_through():
     Без него проверка могла бы отвергать легитимный трафик.
     """
     for variant in ("ws-lanes", "http-lanes"):
-        relay = _HostileRelay("text", variant=variant)
-        relay.behaviour = "pass"
+        relay = _HostileRelay("pass", variant=variant)
         runner = await _serve(relay)
         tunnel = None
         try:
@@ -339,15 +422,10 @@ async def test_lane_zero_stream_zero_frames_are_not_cross_lane():
         (f.encode(f.FrameType.DATA, 7, b"x"), 7),
         (f.encode(f.FrameType.WELCOME, 0), 0),
     ]
-    from mtproxy_bridge.web.carriers import WsLanesCarrier
-
-    carrier = object.__new__(
-        WsLanesCarrier
-    )  # без инициализации: тестируем только хелпер
     for batch, lane_id in carrier_mode_ok:
-        assert carrier._reject_cross_lane(batch, lane_id) is None
+        assert WsLanesCarrier._reject_cross_lane(batch, lane_id) is None
 
     # Битый батч проверка пропускает — формой займётся _on_inbound.
-    assert carrier._reject_cross_lane(b"\xff", 1) is None
+    assert WsLanesCarrier._reject_cross_lane(b"\xff", 1) is None
     with pytest.raises(CarrierFailure):
-        carrier._reject_cross_lane(f.encode(f.FrameType.DATA, 9, b"x"), 1)
+        WsLanesCarrier._reject_cross_lane(f.encode(f.FrameType.DATA, 9, b"x"), 1)
