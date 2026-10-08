@@ -412,13 +412,23 @@ async def _ping_exchange(
     packet = frame_payload(expected_tag, build_req_pq_multi(nonce))
 
     t0 = time.monotonic()
+    # Отправка тоже входит в общий бюджет: send_plain() заканчивается
+    # writer.drain() (direct) либо stream.write() (WEB), который ждёт
+    # кредит окна либо бюджета аплинк-очереди. На одиночный пакет ~104 байт
+    # drain() обычно возвращается сразу (замерено против не читающего пира:
+    # 104 байта -- возврат, 8 МиБ -- парковка), поэтому реальная парковка
+    # это забитый буфер отправки либо релей без кредита окна. Дедлайн общий
+    # с фазой чтения этой же пинг-попытки: --timeout остаётся бюджетом всей
+    # попытки в любом из случаев.
+    deadline = loop.time() + remaining
     try:
-        await send_plain(packet)
+        await asyncio.wait_for(send_plain(packet), timeout=deadline - loop.time())
+    except asyncio.TimeoutError as e:
+        raise _CheckError("ping", "timed out sending request") from e
     except (ConnectionError, BrokenPipeError, OSError) as e:
         raise _CheckError("ping", f"failed to send request: {e}") from e
 
     framer = _FrameReader(expected_tag)
-    deadline = loop.time() + remaining
     while True:
         msg = framer.next_message()
         if msg is None:

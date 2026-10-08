@@ -31,7 +31,10 @@ from mtproxy_bridge.check import (
     _BAD_MSG_NOTIFICATION_ID,
     _REQ_PQ_MULTI_ID,
     _RESPQ_ID,
+    _CheckError,
+    _Collector,
     _FrameReader,
+    _ping_exchange,
     build_req_pq_multi,
     check_link,
     frame_payload,
@@ -297,6 +300,11 @@ def _start_direct_server(mode: str):
     )
 
 
+async def _never():
+    """recv_chunk, который никогда не отдаст данные."""
+    await asyncio.sleep(999)
+
+
 @pytest.fixture
 async def fake_mtproxy():
     server = await _start_direct_server("respq")
@@ -463,3 +471,97 @@ async def test_check_web_negative_echo(web_relay):
     assert result.stage == "ping"
     assert result.mtproto_error is None
     assert "unknown response constructor" in (result.error or "")
+
+
+# ============================================================================
+# Бюджет таймаута: отправка req_pq_multi тоже обязана быть ограничена
+# ============================================================================
+
+
+def _collector() -> _Collector:
+    return _Collector("direct", 2, "padded intermediate")
+
+
+async def test_send_timeout_is_reported_not_hung():
+    """send_plain, зависший на drain()/кредите окна, обязан уложиться в бюджет.
+
+    Заглушка паркуется навсегда по построению: в природе это забитый буфер
+    отправки (drain() на одиночный ~104-байтный пакет возвращается сразу)
+    либо релей, не дающий кредит окна. До фикса отправка шла без wait_for,
+    и в обоих случаях --timeout не имел силы.
+    """
+    calls = []
+
+    async def hang(blob: bytes) -> None:
+        calls.append(blob)
+        await asyncio.sleep(30)  # «прокси не читает»
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(_CheckError) as ei:
+        await _ping_exchange(
+            send_plain=hang,
+            keys_decryptor=None,
+            expected_tag=TAG_PADDED_INTERMEDIATE,
+            collector=_collector(),
+            recv_chunk=_never,
+            remaining=0.25,
+        )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 5, "бюджет отправки не соблюдён"
+    assert ei.value.stage == "ping"
+    assert ei.value.message == "timed out sending request"
+    assert len(calls) == 1
+
+
+async def test_send_timeout_not_misreported_as_send_failure():
+    """Регрессионная привязка порядка except'ов.
+
+    В Python 3.11+ asyncio.TimeoutError — алиас встроенного TimeoutError, а
+    он подкласс OSError. Если бы общий except OSError шёл первым, таймаут
+    превращался бы в обезличенное «failed to send request» и потерял бы
+    диагностическую ценность.
+    """
+    import asyncio as _a
+
+    async def raise_timeout(blob: bytes) -> None:
+        raise _a.TimeoutError()
+
+    with pytest.raises(_CheckError) as ei:
+        await _ping_exchange(
+            send_plain=raise_timeout,
+            keys_decryptor=None,
+            expected_tag=TAG_PADDED_INTERMEDIATE,
+            collector=_collector(),
+            recv_chunk=_never,
+            remaining=30.0,
+        )
+    assert ei.value.message == "timed out sending request"
+
+
+async def test_send_oserror_still_reported_as_send_failure():
+    """Обычная ошибка сокета при отправке по-прежнему диагностируется отдельно."""
+
+    async def broken(blob: bytes) -> None:
+        raise BrokenPipeError("socket closed")
+
+    with pytest.raises(_CheckError) as ei:
+        await _ping_exchange(
+            send_plain=broken,
+            keys_decryptor=None,
+            expected_tag=TAG_PADDED_INTERMEDIATE,
+            collector=_collector(),
+            recv_chunk=_never,
+            remaining=30.0,
+        )
+    assert ei.value.message == "failed to send request: socket closed"
+
+
+async def test_normal_ping_still_works_with_the_deadline_bound(fake_mtproxy):
+    """Позитив: бюджет не срабатывает на нормальном пути."""
+    result = await check_link(
+        f"tg://proxy?server=127.0.0.1&port={fake_mtproxy}&secret={_DIRECT_SECRET_HEX}",
+        timeout=15.0,
+    )
+    assert result.ok, f"{result.stage}: {result.error}"
+    assert [s.name for s in result.stages] == ["parse", "connect", "ping"]
