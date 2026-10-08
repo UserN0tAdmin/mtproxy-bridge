@@ -406,6 +406,9 @@ async def _ping_exchange(
     ``send_plain`` получает уже зафреймленный plain-пакет и отвечает за
     приклейку obfuscated2-заголовка/обёртки TLS (см. вызовы в _run_*).
     Всегда завершается исключением _PingOK/_CheckError.
+
+    ``remaining`` — бюджет всей пинг-попытки в секундах, отправка и чтение
+    в нём делят один дедлайн.
     """
     loop = asyncio.get_running_loop()
     nonce = secrets.token_bytes(16)
@@ -425,7 +428,7 @@ async def _ping_exchange(
         await asyncio.wait_for(send_plain(packet), timeout=deadline - loop.time())
     except asyncio.TimeoutError as e:
         raise _CheckError("ping", "timed out sending request") from e
-    except (ConnectionError, BrokenPipeError, OSError) as e:
+    except (ConnectionError, OSError) as e:
         raise _CheckError("ping", f"failed to send request: {e}") from e
 
     framer = _FrameReader(expected_tag)

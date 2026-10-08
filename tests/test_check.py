@@ -21,12 +21,14 @@ import asyncio
 import hashlib
 import secrets
 import struct
+import time
 
 import pytest
 from aiohttp import web
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from test_web_integration import HOST, MockRelay
 
+from mtproxy_bridge import check as check_mod
 from mtproxy_bridge.check import (
     _BAD_MSG_NOTIFICATION_ID,
     _REQ_PQ_MULTI_ID,
@@ -494,7 +496,7 @@ async def test_send_timeout_is_reported_not_hung():
 
     async def hang(blob: bytes) -> None:
         calls.append(blob)
-        await asyncio.sleep(30)  # «прокси не читает»
+        await asyncio.sleep(10)  # «прокси не читает»
 
     started = asyncio.get_running_loop().time()
     with pytest.raises(_CheckError) as ei:
@@ -555,6 +557,83 @@ async def test_send_oserror_still_reported_as_send_failure():
             remaining=30.0,
         )
     assert ei.value.message == "failed to send request: socket closed"
+
+
+async def test_send_time_shares_the_budget_with_the_read_phase():
+    """Дедлайн у отправки и чтения один: чтение получает remaining - send.
+
+    Юниты выше зовут приватный ``_ping_exchange`` с рукописным
+    ``send_plain`` и потому не держат связку с местами вызова. Если
+    ``deadline = loop.time() + remaining`` уедет обратно под
+    ``framer = _FrameReader(...)``, бюджет чтения снова станет равным
+    ``remaining`` и таймаут сработает на ``send + remaining``.
+    """
+    send_sleep = 0.2
+    budget = 0.3
+
+    async def slow_send(blob: bytes) -> None:
+        await asyncio.sleep(send_sleep)
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(_CheckError) as ei:
+        await _ping_exchange(
+            send_plain=slow_send,
+            keys_decryptor=None,
+            expected_tag=TAG_PADDED_INTERMEDIATE,
+            collector=_collector(),
+            recv_chunk=_never,
+            remaining=budget,
+        )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < budget + 0.15, f"бюджет чтения не общий: {elapsed:.2f} c"
+    assert ei.value.message == "timed out waiting for MTProto response"
+
+
+class _StalledWriter:
+    """StreamWriter-заглушка: write — no-op, drain паркуется навсегда."""
+
+    def write(self, data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        await asyncio.sleep(999)
+
+    def close(self) -> None:
+        pass
+
+
+class _IdleReader:
+    async def read(self, _n: int) -> bytes:
+        await asyncio.sleep(999)
+        return b""
+
+
+async def test_check_returns_when_the_req_pq_send_parks(monkeypatch):
+    """E2E: send_plain, зависший на writer.drain(), не выводит check за --timeout.
+
+    Заглушка паркует ``drain()`` навсегда — ровно то, чем кончается
+    ``send_plain`` в direct-режиме, когда буфер отправки забит. До
+    ``466265d`` отправка шла без ``wait_for`` и ``check_link`` не
+    возвращался вовсе; юниты выше этот сценарий не покрывают, потому
+    что дёргают ``_ping_exchange`` напрямую.
+    """
+
+    async def stalled_open_connection(*_args, **_kwargs):
+        return _IdleReader(), _StalledWriter()
+
+    # check.py зовёт asyncio.open_connection; патчим атрибут на том же
+    # объекте asyncio, которым он пользуется (monkeypatch откатит).
+    monkeypatch.setattr(check_mod.asyncio, "open_connection", stalled_open_connection)
+
+    link = f"tg://proxy?server=127.0.0.1&port=443&secret={_DIRECT_SECRET_HEX}"
+    started = time.monotonic()
+    result = await check_link(link, timeout=2.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5, f"check не уложился в бюджет --timeout: {elapsed:.1f} c"
+    assert result.stage == "ping"
+    assert result.error == "timed out sending request"
 
 
 async def test_normal_ping_still_works_with_the_deadline_bound(fake_mtproxy):
