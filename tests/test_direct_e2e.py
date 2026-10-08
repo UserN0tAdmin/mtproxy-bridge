@@ -699,7 +699,8 @@ class TestActivityTimeout:
     ):
         # Контракт из config.py: достаточно одного байта за интервал В ЛЮБОМ
         # направлении. Клиент молчит, но прокси шлёт апдейты — соединение
-        # должно жить. Сейчас оно рвётся по таймеру молчащего направления.
+        # должно жить: общий дедлайн _ActivityDeadline отодвигается
+        # активностью любого направления.
         monkeypatch.setattr(relay_mod, "ACTIVITY_TIMEOUT_SECS", 0.5)
 
         async def pusher(conn: Conn) -> None:
@@ -715,3 +716,34 @@ class TestActivityTimeout:
             assert got == b"u" * 10
         finally:
             await close_writer(writer)
+
+    async def test_client_activity_keeps_a_silent_upstream_alive(
+        self, env_factory, monkeypatch
+    ):
+        # Симметрия к test_server_push_keeps_a_silent_client_alive: байта
+        # клиента за интервал хватает, чтобы соединение жило, даже когда
+        # upstream молчит три интервала. Байты клиента при этом всё равно
+        # доходят до прокси — общий дедлайн это не отключает.
+        # До общего дедлайна read upstream->client падал по своему таймауту
+        # и рвал сессию при активном клиенте.
+        monkeypatch.setattr(relay_mod, "ACTIVITY_TIMEOUT_SECS", 0.5)
+
+        async def silent_then_answer(conn: Conn) -> None:
+            await conn.read()  # ping
+            await asyncio.sleep(1.5)  # три интервала молчания upstream
+            await conn.write(b"z")
+            while await conn.read():  # дренаж до закрытия клиентом
+                pass
+
+        env = await env_factory(silent_then_answer)
+        reader, writer = await env.session(PING)
+        try:
+            for _ in range(8):
+                await asyncio.sleep(0.2)
+                writer.write(b"k")
+            assert await _read_until(reader, 1, 5) == b"z"
+        finally:
+            await close_writer(writer)
+        # Байты клиента дошли до прокси целиком: ping + 8 байтов.
+        await asyncio.wait_for(env.proxy.connections[0].closed.wait(), 5)
+        assert len(env.proxy.connections[0].received) == len(PING) + 8

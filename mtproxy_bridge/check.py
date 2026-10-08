@@ -236,7 +236,11 @@ class _FrameReader:
         self._buf += plain
 
     def next_message(self) -> bytes | None:
-        """Возвращает готовое сообщение или None, если фрейм неполный."""
+        """Возвращает готовое сообщение или None, если фрейм неполный.
+
+        Quick-ack-слова (старший бит) съедаются молша: None означает
+        только «в буфере меньше 4 байт либо фрейм не добиран».
+        """
         buf = self._buf
         if self._tag == TAG_PADDED_INTERMEDIATE:
             # IntermediateTransport::read_from_stream: uint32 LE длина payload;

@@ -370,8 +370,9 @@ async def _handle_client(
                         data = await idle.read(lambda: reader.read(65536))
                     except asyncio.TimeoutError:
                         log.warning(
-                            f"[client {client_addr}] client->upstream: no activity for "
-                            f"{ACTIVITY_TIMEOUT_SECS}s — closing by activity timeout"
+                            f"[client {client_addr}] connection idle for "
+                            f"{ACTIVITY_TIMEOUT_SECS}s (no bytes in either direction) "
+                            f"— closing by activity timeout"
                         )
                         break
                     if not data:
@@ -405,8 +406,9 @@ async def _handle_client(
                         plain_wire, eof = await recv_upstream()
                     except asyncio.TimeoutError:
                         log.warning(
-                            f"[client {client_addr}] upstream->client: no activity for "
-                            f"{ACTIVITY_TIMEOUT_SECS}s — closing by activity timeout"
+                            f"[client {client_addr}] connection idle for "
+                            f"{ACTIVITY_TIMEOUT_SECS}s (no bytes in either direction) "
+                            f"— closing by activity timeout"
                         )
                         break
                     if eof:
