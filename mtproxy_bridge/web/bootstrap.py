@@ -50,6 +50,17 @@
    ``X-Carrier-Mode`` ответа ``POST /api/v1/session``; клиент принимает
    любой режим из объявленных capabilities.
 
+4. mtproto.zig (``src/web/page.zig``, ``renderSessionBridge``) — страница
+   без ``bootstrap``/``carrierMode``: токен WebSocket-carrier'а лежит прямо
+   в метаданных, REST-сессии (``/api/v1/session``, ``/up``, ``/down``) нет::
+
+       <meta name="tproxy-token" content="<43 символа base64url>">
+       <meta name="tproxy-ws-path" content="/api/v1/socket">
+
+   Режим ``native-websocket``: одноразовый токен (TTL 120 с) уходит в
+   subprotocol ``tproxy-v1.<token>``, HELLO/WELCOME идут уже внутри
+   сокета. Проверяется ПЕРВЫМ — это самый специфичный признак.
+
 Парсер терпим к регистру, разделителям (``=``/``:``) и кавычкам, но строг
 к формату значений; строки вида ``carrier==='websocket'`` (сравнение)
 не матчатся из-за двойного ``=`` перед значением.
@@ -57,6 +68,7 @@
 
 from __future__ import annotations
 
+import html as _html
 import re
 from dataclasses import dataclass
 
@@ -66,6 +78,12 @@ DEFAULT_BATCH_LIMIT = 2 * 1024 * 1024
 MAX_BATCH_LIMIT = 2 * 1024 * 1024  # потолок desktop-клиента (loopback fallback)
 
 CARRIER_MODES = frozenset({"https", "https-lanes", "websocket", "websocket-lanes"})
+
+# mtproto.zig: один WebSocket, токен берётся прямо из страницы (без REST-сессии).
+NATIVE_WS_MODE = "native-websocket"
+# Релей отбрасывает WS-сообщение крупнее 1 МиБ + 8 байт (ws.max_message), а
+# общий потолок моста — 2 МиБ. Берём половину лимита релея с запасом.
+NATIVE_BATCH_LIMIT = 512 * 1024
 
 # Предпочтительный порядок при разборе carrierCapabilities (новый формат).
 PREFERRED_CARRIER_ORDER = (
@@ -91,6 +109,18 @@ _CAPABILITIES_RE = re.compile(
 _BATCH_LIMIT_RE = re.compile(
     r"""batch[a-z_-]{0,3}limit["']?\s*[:=]\s*(\d{1,12})""", re.IGNORECASE
 )
+# mtproto.zig: <meta name="tproxy-token" content="..."> / tproxy-ws-path.
+# Значение ws-path HTML-экранировано (appendHtmlAttribute), поэтому кавычки
+# внутри него встречаются только как &quot; и ``[^"]*`` безопасен.
+_META_TOKEN_RE = re.compile(
+    r"""<meta\s+name\s*=\s*["']tproxy-token["']\s+content\s*=\s*["']([^"']*)["']""",
+    re.IGNORECASE,
+)
+_META_WS_PATH_RE = re.compile(
+    r'''<meta\s+name\s*=\s*["']tproxy-ws-path["']\s+content\s*=\s*"([^"]*)"''',
+    re.IGNORECASE,
+)
+_TOKEN_VALUE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
 @dataclass(frozen=True)
@@ -104,6 +134,8 @@ class BridgePage:
     # один элемент; для carrierCapabilities — все распознанные режимы.
     # Сервер может выбрать любой из них (см. X-Carrier-Mode).
     allowed_modes: frozenset[str] = frozenset()
+    # Только для native-websocket: same-origin путь WebSocket-эндпоинта.
+    ws_path: str = ""
 
 
 def _select_preferred_mode(available: set[str]) -> str:
@@ -127,6 +159,41 @@ def _parse_capabilities(raw: str) -> set[str]:
     return modes
 
 
+def _validate_ws_path(path: str) -> str:
+    """Те же правила, что ``validateWsPath`` релея: same-origin абсолютный путь."""
+    if (
+        not path.startswith("/")
+        or path.startswith("//")
+        or any(ch in path for ch in "?#\\")
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path)
+    ):
+        raise BootstrapRejected(
+            f"bridge page announces unusable websocket path {path!r}"
+        )
+    return path
+
+
+def _parse_native_page(html: str) -> BridgePage | None:
+    """Разбирает страницу mtproto.zig; ``None`` — это не она."""
+    token_match = _META_TOKEN_RE.search(html)
+    if token_match is None:
+        return None
+    token = token_match.group(1)
+    if _TOKEN_VALUE_RE.fullmatch(token) is None:
+        raise BootstrapRejected("bridge page carries a malformed tproxy-token")
+    path_match = _META_WS_PATH_RE.search(html)
+    if path_match is None:
+        raise BootstrapRejected("bridge page has tproxy-token but no tproxy-ws-path")
+    ws_path = _validate_ws_path(_html.unescape(path_match.group(1)))
+    return BridgePage(
+        token=token,
+        carrier_mode=NATIVE_WS_MODE,
+        batch_limit=NATIVE_BATCH_LIMIT,
+        allowed_modes=frozenset({NATIVE_WS_MODE}),
+        ws_path=ws_path,
+    )
+
+
 def parse_bridge_page(html: str) -> BridgePage:
     """Извлекает bootstrap/carrier-mode/batch-limit из HTML страницы.
 
@@ -134,6 +201,10 @@ def parse_bridge_page(html: str) -> BridgePage:
         BootstrapRejected: страница не содержит корректного токена или
             не объявляет ни фиксированный carrier-режим, ни capabilities.
     """
+    native = _parse_native_page(html)
+    if native is not None:
+        return native
+
     token_match = _TOKEN_RE.search(html)
     if token_match is None:
         raise BootstrapRejected(
@@ -188,6 +259,13 @@ async def fetch_bridge_page(api: WebApi, capability: str) -> BridgePage:
     """
     resp = await api.get_bridge_page(capability)
     if resp.status != 200 or not resp.body:
-        raise BootstrapRejected(f"bridge page request failed: HTTP {resp.status}")
+        hint = ""
+        if resp.status == 404:
+            # И mtproto.zig, и tproxy-server отвечают на чужую capability
+            # обычной страницей-прикрытием/404, а не явной ошибкой.
+            hint = (
+                " (capability not recognised: wrong secret/host, or WEB relay disabled)"
+            )
+        raise BootstrapRejected(f"bridge page request failed: HTTP {resp.status}{hint}")
     html = resp.body.decode("utf-8", errors="replace")
     return parse_bridge_page(html)

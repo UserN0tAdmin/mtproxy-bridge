@@ -22,7 +22,9 @@
 
 1. bootstrap-страница → одноразовый токен;
 2. ``POST /api/v1/session`` (HELLO) → сессия + WELCOME, режим carrier'а
-   фиксирован ответом ``X-Carrier-Mode``;
+   фиксирован ответом ``X-Carrier-Mode``. Исключение — страница
+   mtproto.zig (``native-websocket``): REST-сессии нет, токен сразу идёт в
+   WebSocket, HELLO/WELCOME выполняет сам carrier;
 3. каждое клиентское соединение — новый непереиспользуемый ненулевой
    stream id и один OPEN;
 4. байты клиента едут DATA в пределах выданного кредита окна; прочитанные
@@ -43,7 +45,7 @@ from collections import deque
 from ..links import WebProxyLink
 from ..utils import log
 from . import frames as f
-from .bootstrap import fetch_bridge_page
+from .bootstrap import NATIVE_WS_MODE, BridgePage, fetch_bridge_page
 from .carriers import BaseCarrier, CarrierFailure, build_carrier
 from .frames import FrameError
 from .http_api import BootstrapRejected, ProtocolViolation, WebApi
@@ -326,8 +328,15 @@ class WebTunnel:
                 await self._kill_session(f"bad relay frame shape: {exc}")
                 return
             ftype = frame.type
-            if ftype in (f.FrameType.WELCOME, f.FrameType.PING):
-                # WELCOME уже проверен при создании сессии; PING не используем.
+            if ftype is f.FrameType.PING:
+                # Релей mtproto.zig рвёт carrier после 90 с без входящих;
+                # tproxy-server PONG не требует — там wants_pong == False.
+                carrier = self._carrier
+                if carrier is not None and carrier.wants_pong:
+                    self._answer_ping(carrier, frame.payload)
+                continue
+            if ftype is f.FrameType.WELCOME:
+                # WELCOME уже проверен при создании сессии.
                 continue
             if ftype is f.FrameType.BYE:
                 await self._kill_session("relay sent BYE")
@@ -358,6 +367,22 @@ class WebTunnel:
                 if carrier is not None and carrier.failed is None:
                     with contextlib.suppress(Exception):
                         await carrier.forget_lane(frame.stream_id)
+
+    def _answer_ping(self, carrier: BaseCarrier, payload: bytes) -> None:
+        """PONG с тем же payload — фоновой задачей, чтобы не блокировать reader.
+
+        ``enqueue`` может ждать места в очереди аплинка; reader в это время
+        обязан читать дальше. При полной очереди PONG и не нужен: релей
+        считает живым любой входящий трафик.
+        """
+
+        async def _pong() -> None:
+            with contextlib.suppress(Exception):
+                await carrier.enqueue(f.encode(f.FrameType.PONG, 0, payload))
+
+        task = asyncio.get_running_loop().create_task(_pong())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def _on_stream_reset(self, stream_id: int) -> None:
         """Падение установленного lane-сокета (websocket-lanes)."""
@@ -452,6 +477,9 @@ class WebTunnel:
         # Фрейм (кусок + заголовок) обязан влезать в batch_limit релея;
         # нижняя граница — защита от бессмысленных значений.
         self._data_chunk = max(min(f.DATA_CHUNK, page.batch_limit - f.HEADER_SIZE), 1)
+        if page.carrier_mode == NATIVE_WS_MODE:
+            await self._bootstrap_native(page)
+            return
         resp = await self._api.create_session(page.token, f.hello_frame())
         if resp.status != 200:
             raise BootstrapRejected(f"session creation rejected: HTTP {resp.status}")
@@ -497,5 +525,36 @@ class WebTunnel:
             "[web-tunnel] web session established via %s (mode=%s, batch_limit=%d)",
             self._origin,
             announced_mode,
+            page.batch_limit,
+        )
+
+    async def _bootstrap_native(self, page: BridgePage) -> None:
+        """mtproto.zig: токен страницы → WebSocket → HELLO/WELCOME (в carrier'е)."""
+        carrier = build_carrier(
+            NATIVE_WS_MODE,
+            self._api,
+            page.token,
+            batch_limit=page.batch_limit,
+            on_inbound=self._on_inbound,
+            on_failure=self._on_carrier_failure,
+            on_stream_reset=self._on_stream_reset,
+            ws_path=page.ws_path,
+        )
+        try:
+            await carrier.start()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await carrier.aclose(grace=0.0)
+            raise
+        self._carrier = carrier
+        # REST-сессии нет: пустой токен отключает DELETE /api/v1/session в aclose().
+        self._session_token = ""
+        self._carrier_mode = NATIVE_WS_MODE
+        self._next_stream_id = 1
+        log.info(
+            "[web-tunnel] web session established via %s (mode=%s, ws_path=%s, batch_limit=%d)",
+            self._origin,
+            NATIVE_WS_MODE,
+            page.ws_path,
             page.batch_limit,
         )

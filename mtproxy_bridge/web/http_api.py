@@ -148,23 +148,38 @@ class WebApi:
             self._session = aiohttp.ClientSession(timeout=timeout, cookie_jar=jar)
         return self._session
 
-    async def ws_connect(self, subprotocol: str) -> aiohttp.ClientWebSocketResponse:
-        """Открывает WebSocket /api/v1/ws с точным subprotocol.
+    async def ws_connect(
+        self,
+        subprotocol: str,
+        *,
+        path: str = "/api/v1/ws",
+        compress: int | None = None,
+    ) -> aiohttp.ClientWebSocketResponse:
+        """Открывает WebSocket (по умолчанию /api/v1/ws) с точным subprotocol.
 
         Liveness-пинги релея отвечаются автоматически (autoping); текстовые
         сообщения и превышение размера ловятся на чтении.
+
+        ``path`` — для релеев, у которых эндпоинт другой (mtproto.zig:
+        ``/api/v1/socket``, объявляется страницей). ``compress=0`` не
+        предлагает permessage-deflate (релей mtproto.zig расширений не знает).
         """
         session = await self._http()
-        url = self._origin + "/api/v1/ws"
         if self._origin.startswith("https://"):
-            url = "wss://" + self._origin[len("https://") :] + "/api/v1/ws"
-        elif not self._origin.startswith("http://"):
+            url = "wss://" + self._origin[len("https://") :] + path
+        elif self._origin.startswith("http://"):
+            url = self._origin + path
+        else:
             raise WebApiError(f"unsupported origin {self._origin!r}")
+        kwargs: dict = {}
+        if compress is not None:
+            kwargs["compress"] = compress
         return await session.ws_connect(
             url,
             protocols=[subprotocol],
             max_msg_size=_WS_MAX_MSG_SIZE,
             autoping=True,
+            **kwargs,
         )
 
     async def close(self) -> None:

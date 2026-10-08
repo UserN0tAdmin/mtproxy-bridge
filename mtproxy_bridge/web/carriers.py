@@ -30,6 +30,10 @@
   ``tproxy-lane-v1.<token>.<id>``; падение установленного сокета закрывает
   только его поток, неудача установки нового лейна роняет всю сессию.
 
+Плюс нестандартный режим ``native-websocket`` (mtproto.zig): тот же
+мультиплексирующий сокет, но токен берётся прямо из bridge-страницы, путь
+эндпоинта объявляет страница, а HELLO/WELCOME идут внутри сокета.
+
 Ограничения очередей повторяют референсный bridge: глобально 32 МиБ /
 16384 элементов, на lane 8 МиБ / 1024 элементов. Батчи упаковываются по
 правилам ``joinPending`` референса: целые элементы, а чрезмерно крупная
@@ -47,13 +51,15 @@ import aiohttp
 
 from ..utils import log
 from . import frames as f
+from .bootstrap import NATIVE_WS_MODE
 from .frames import FrameError
-from .http_api import WebApi
+from .http_api import BootstrapRejected, ProtocolViolation, WebApi
 
 UPLINK_QUEUE_BYTES = 32 * 1024 * 1024
 UPLINK_QUEUE_ITEMS = 16384
 LANE_QUEUE_BYTES = 8 * 1024 * 1024
 LANE_QUEUE_ITEMS = 1024
+NATIVE_HANDSHAKE_TIMEOUT_SECS = 15.0
 
 InboundCallback = Callable[[bytes], Awaitable[None]]
 FailureCallback = Callable[[BaseException], Awaitable[None]]
@@ -186,6 +192,8 @@ class BaseCarrier:
     """
 
     mode: ClassVar[str] = ""
+    # (mtproto.zig: PING каждые 20 с тишины, обрыв после 90 с без входящих)
+    wants_pong: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -416,7 +424,8 @@ class WsCarrier(BaseCarrier):
         self._spawn(self._guarded("reader", self._reader_loop))
         self._spawn(self._guarded("writer", self._writer_loop))
 
-    async def _reader_loop(self) -> None:
+    async def _open_socket(self) -> aiohttp.ClientWebSocketResponse:
+        """Устанавливает WebSocket carrier'а (переопределяется native-режимом)."""
         expected = f"tproxy-v1.{self._token}"
         ws = await self._api.ws_connect(expected)
         if ws.protocol != expected:
@@ -424,6 +433,10 @@ class WsCarrier(BaseCarrier):
             raise CarrierFailure(
                 f"relay echoed unexpected websocket subprotocol {ws.protocol!r}"
             )
+        return ws
+
+    async def _reader_loop(self) -> None:
+        ws = await self._open_socket()
         self._socket = ws
         self._socket_ready.set()
         try:
@@ -459,6 +472,88 @@ class WsCarrier(BaseCarrier):
         self._socket_ready.clear()
         if socket is not None and not socket.closed:
             await socket.close()
+
+
+class NativeWsCarrier(WsCarrier):
+    """native-websocket (mtproto.zig): один сокет, токен из bridge-страницы.
+
+    Отличия от :class:`WsCarrier` (tproxy-server):
+
+    - токен одноразовый (TTL 120 с) и выдан самой страницей, а не
+      ``POST /api/v1/session``; REST-сессии нет вовсе;
+    - путь эндпоинта объявляет страница (``tproxy-ws-path``);
+    - HELLO — первое и единственное сообщение в сокете, WELCOME — первое и
+      единственное сообщение в ответ; всё это происходит в :meth:`start`,
+      чтобы ошибки bootstrap'а видел вызывающий ``open_stream``, а не
+      фоновая задача;
+    - релей пингует тихий carrier и ждёт любой входящий трафик
+      (:attr:`wants_pong`).
+    """
+
+    mode = NATIVE_WS_MODE
+    wants_pong = True
+
+    def __init__(self, *args, ws_path: str, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._ws_path = ws_path
+        self._preopened: aiohttp.ClientWebSocketResponse | None = None
+
+    async def start(self) -> None:
+        self._preopened = await self._handshake()
+        await super().start()
+
+    async def _open_socket(self) -> aiohttp.ClientWebSocketResponse:
+        ws, self._preopened = self._preopened, None
+        if ws is None:  # start() не вызывался — внутренний баг
+            raise CarrierFailure("native websocket was not opened by start()")
+        return ws
+
+    async def _teardown_transport(self) -> None:
+        # Сокет мог быть открыт, но ещё не подхвачен reader'ом.
+        pending, self._preopened = self._preopened, None
+        if pending is not None and not pending.closed:
+            await pending.close()
+        await super()._teardown_transport()
+
+    async def _handshake(self) -> aiohttp.ClientWebSocketResponse:
+        expected = f"tproxy-v1.{self._token}"
+        try:
+            ws = await asyncio.wait_for(
+                self._api.ws_connect(expected, path=self._ws_path, compress=0),
+                NATIVE_HANDSHAKE_TIMEOUT_SECS,
+            )
+        except aiohttp.WSServerHandshakeError as exc:
+            # Токен не принят (истёк/уже использован/чужой Origin) либо релей
+            # переполнен (503): страница-прикрытие вместо 101.
+            raise BootstrapRejected(
+                f"relay refused websocket upgrade: HTTP {exc.status}"
+            ) from exc
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            raise CarrierFailure(f"websocket upgrade failed: {exc!r}") from exc
+        try:
+            if ws.protocol != expected:
+                raise ProtocolViolation(
+                    f"relay echoed unexpected websocket subprotocol {ws.protocol!r}"
+                )
+            # HELLO обязан быть единственным фреймом первого сообщения.
+            await ws.send_bytes(f.hello_frame())
+            msg = await asyncio.wait_for(ws.receive(), NATIVE_HANDSHAKE_TIMEOUT_SECS)
+            if msg.type is not aiohttp.WSMsgType.BINARY:
+                raise ProtocolViolation(
+                    f"relay answered HELLO with {msg.type.name.lower()} "
+                    f"(close code {getattr(ws, 'close_code', None)})"
+                )
+            try:
+                welcome = f.parse_batch(msg.data)
+            except FrameError as exc:
+                raise ProtocolViolation(f"bad WELCOME batch: {exc}") from exc
+            if not f.is_welcome(welcome):
+                raise ProtocolViolation("first relay message is not a single WELCOME")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await ws.close()
+            raise
+        return ws
 
 
 class LaneBasedCarrier(BaseCarrier):
@@ -724,8 +819,12 @@ def build_carrier(
     on_inbound: InboundCallback,
     on_failure: FailureCallback,
     on_stream_reset: StreamResetCallback | None = None,
+    ws_path: str | None = None,
 ) -> BaseCarrier:
-    """Фабрика carrier'а по режиму, объявленному релеем."""
+    """Фабрика carrier'а по режиму, объявленному релеем.
+
+    ``ws_path`` нужен только режиму ``native-websocket``.
+    """
     kwargs = dict(
         batch_limit=batch_limit,
         on_inbound=on_inbound,
@@ -740,4 +839,8 @@ def build_carrier(
         return WsCarrier(api, session_token, **kwargs)
     if mode == "websocket-lanes":
         return WsLanesCarrier(api, session_token, **kwargs)
+    if mode == NATIVE_WS_MODE:
+        if not ws_path:
+            raise ValueError("native-websocket carrier requires ws_path")
+        return NativeWsCarrier(api, session_token, ws_path=ws_path, **kwargs)
     raise ValueError(f"unknown carrier mode {mode!r}")
