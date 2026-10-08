@@ -255,6 +255,40 @@ class BaseCarrier:
     async def forget_lane(self, lane_id: int) -> None:
         """Локально закрывает транспорт потока (нет-op для плоских)."""
 
+    def _reject_cross_lane(self, batch: bytes, lane_id: int) -> None:
+        """Отвергает батч, содержащий кадры чужого лейна.
+
+        PROTOCOL.md:309-311 — «For a nonzero lane, every frame in an
+        uplink body and every frame returned by its downlink poll must
+        have a ``stream_id`` equal to ``X-Lane-ID``». Референсные bridge'ы
+        реагируют отказом родительского carrier'а (page.go:307,
+        page.go:363). Без этой проверки батч уходит в ``_on_inbound``,
+        который маршрутизирует чисто по ``frame.stream_id``: кадр чужого
+        потока либо уходит в тот поток (мисроутинг), либо молча дропается,
+        если тот уже закрыт.
+
+        Парсим в carrier'е, а не протягиваем ``lane_id`` в ``_on_inbound``:
+        двойной ``parse_batch`` — линейный скан memoryview на батч ≤2 МиБ,
+        на фоне HTTP round-trip он не измерим, но зато подпись колбэка и
+        внутренняя логика туннеля остаются нетронутыми.
+
+        Битый батч намеренно пропускаем: формой ответит ``_on_inbound``,
+        не дублируя диагностику.
+
+        Raises:
+            CarrierFailure: в батче есть кадр с ``stream_id != lane_id``.
+        """
+        try:
+            frames = f.parse_batch(batch)
+        except FrameError:
+            return
+        for frame in frames:
+            if frame.stream_id != lane_id:
+                raise CarrierFailure(
+                    f"cross-lane frame: stream {frame.stream_id} "
+                    f"delivered in lane {lane_id}"
+                )
+
     def _has_pending(self) -> bool:
         """Есть ли неотправленные аплинк-байты."""
         return bool(self._pending)
@@ -710,6 +744,7 @@ class HttpsLanesCarrier(LaneBasedCarrier):
                 await self.forget_lane(lane.lane_id)
                 return
             if result.has_data:
+                self._reject_cross_lane(result.body, lane.lane_id)
                 await self._on_inbound(result.body)
             lane.cursor = result.next_cursor
 
@@ -774,6 +809,7 @@ class WsLanesCarrier(LaneBasedCarrier):
                     raise CarrierFailure(
                         "relay sent an empty binary message on a lane socket"
                     )
+                self._reject_cross_lane(msg.data, lane.lane_id)
                 await self._on_inbound(msg.data)
         except asyncio.CancelledError:
             established = False

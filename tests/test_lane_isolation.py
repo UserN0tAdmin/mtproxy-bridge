@@ -64,15 +64,29 @@ class _HostileRelay:
     потока.
     """
 
-    def __init__(self, behaviour: str) -> None:
-        assert behaviour in ("text", "empty-binary", "cross-lane", "graceful-close")
+    def __init__(self, behaviour: str, variant: str = "ws-lanes") -> None:
+        assert behaviour in (
+            "text",
+            "empty-binary",
+            "cross-lane",
+            "graceful-close",
+            "pass",
+        )
+        assert variant in ("ws-lanes", "http-lanes")
         self.behaviour = behaviour
+        self.variant = variant
         self.bootstrap = _random_token()
         self.session_token = _random_token()
         self.sockets: list[web.WebSocketResponse] = []
+        self.lane_payload = b""
+        self.lane_ready = asyncio.Event()
+        self.capability = ""
 
     def make_app(self) -> web.Application:
         relay = self
+        carrier_mode = (
+            "websocket-lanes" if relay.variant == "ws-lanes" else "https-lanes"
+        )
 
         async def handle_root(request: web.Request) -> web.Response:
             if (
@@ -85,7 +99,7 @@ class _HostileRelay:
                     "<!doctype html><script>"
                     f'const relayOrigin="https://{HOST}",'
                     f'bootstrap="{relay.bootstrap}",'
-                    'carrierMode="websocket-lanes";'
+                    f'carrierMode="{carrier_mode}";'
                     "</script>"
                 ),
                 content_type="text/html",
@@ -105,10 +119,33 @@ class _HostileRelay:
                 status=200,
                 headers={
                     "X-Session-Token": relay.session_token,
-                    "X-Carrier-Mode": "websocket-lanes",
+                    "X-Carrier-Mode": carrier_mode,
                     "X-Down-Cursor": "0",
                 },
                 body=f.encode(f.FrameType.WELCOME, 0),
+            )
+
+        async def handle_up(request: web.Request) -> web.Response:
+            # Аплинк только квитируем: лейн в тестах создаётся OPEN-ом.
+            return web.Response(status=204, headers={"X-Up-Ack": "1"})
+
+        async def handle_down(request: web.Request) -> web.Response:
+            lane_id = int(request.headers.get("X-Lane-ID", "0"))
+            if relay.behaviour == "cross-lane":
+                return web.Response(
+                    status=200,
+                    headers={"X-Down-Cursor": "1"},
+                    body=f.encode(f.FrameType.DATA, lane_id + 100, b"misrouted"),
+                )
+            if relay.behaviour == "text":
+                # Мусорный батч: _on_inbound убьёт сессию — это не наш путь.
+                return web.Response(status=200, body=b"\x00\x00")
+            # Штатный (позитивный) случай: кадр этого же лейна.
+            await relay.lane_ready.wait()
+            return web.Response(
+                status=200,
+                headers={"X-Down-Cursor": "1"},
+                body=f.encode(f.FrameType.DATA, lane_id, relay.lane_payload),
             )
 
         async def handle_ws(request: web.Request) -> web.WebSocketResponse:
@@ -143,6 +180,13 @@ class _HostileRelay:
                 # Штатный сценарий: CLOSE этого же лейна, затем разрыв.
                 await ws.send_bytes(f.encode(f.FrameType.CLOSE, lane_id))
                 await ws.close()
+            else:
+                # Позитив: кадр ровно того потока, что у лейна.
+                await relay.lane_ready.wait()
+                await ws.send_bytes(
+                    f.encode(f.FrameType.DATA, lane_id, relay.lane_payload)
+                )
+                await ws.close()
 
             try:
                 async for _ in ws:
@@ -154,6 +198,8 @@ class _HostileRelay:
         app = web.Application()
         app.router.add_get("/", handle_root)
         app.router.add_post("/api/v1/session", handle_session)
+        app.router.add_post("/api/v1/up", handle_up)
+        app.router.add_post("/api/v1/down", handle_down)
         app.router.add_get("/api/v1/ws", handle_ws)
         return app
 
@@ -196,9 +242,14 @@ async def test_relay_violation_kills_parent_carrier(behaviour):
         assert isinstance(carrier.failed, CarrierFailure)
         # Смерть carrier'а = смерть сессии: открытые стримы сброшены.
         assert tunnel._streams == {} or all(s.closed for s in tunnel._streams.values())
+        if behaviour == "cross-lane":
+            # Причина обязана приходить из lane-проверки, а не из общего
+            # _kill_session: иначе тест проходил бы и без неё.
+            assert "cross-lane" in str(carrier.failed)
     finally:
-        with contextlib.suppress(Exception):
-            await tunnel.aclose()
+        if tunnel is not None:
+            with contextlib.suppress(Exception):
+                await tunnel.aclose()
         await runner.cleanup()
 
 
@@ -224,3 +275,79 @@ async def test_graceful_lane_close_resets_only_that_stream():
         if tunnel is not None:
             await tunnel.aclose()
         await runner.cleanup()
+
+
+async def test_https_lanes_cross_lane_frame_kills_carrier():
+    """Тот же контракт в https-lanes: чужой кадр в /down лейна."""
+    relay = _HostileRelay("cross-lane", variant="http-lanes")
+    runner = await _serve(relay)
+    tunnel = None
+    try:
+        tunnel = await _open_session(relay, runner)
+        carrier = tunnel._carrier
+        assert carrier is not None
+        assert tunnel.carrier_mode == "https-lanes"
+
+        for _ in range(300):
+            if carrier.failed is not None:
+                break
+            await asyncio.sleep(0.02)
+
+        assert carrier.failed is not None
+        assert "cross-lane" in str(carrier.failed)
+    finally:
+        if tunnel is not None:
+            with contextlib.suppress(Exception):
+                await tunnel.aclose()
+        await runner.cleanup()
+
+
+async def test_correct_lane_frames_pass_through():
+    """Позитив: кадры с совпадающим lane_id не отклоняются проверкой.
+
+    Без него проверка могла бы отвергать легитимный трафик.
+    """
+    for variant in ("ws-lanes", "http-lanes"):
+        relay = _HostileRelay("text", variant=variant)
+        relay.behaviour = "pass"
+        runner = await _serve(relay)
+        tunnel = None
+        try:
+            tunnel = await _open_session(relay, runner)
+            carrier = tunnel._carrier
+            assert carrier is not None
+
+            stream = await asyncio.wait_for(tunnel.open_stream(), timeout=10)
+            relay.lane_payload = b"payload"
+            relay.lane_ready.set()
+
+            assert await asyncio.wait_for(stream.read(), timeout=10) == b"payload", (
+                variant
+            )
+            assert carrier.failed is None, variant
+        finally:
+            if tunnel is not None:
+                with contextlib.suppress(Exception):
+                    await tunnel.aclose()
+            await runner.cleanup()
+
+
+async def test_lane_zero_stream_zero_frames_are_not_cross_lane():
+    """Lane 0 несёт stream-0 кадры — проверка не должна их отвергать."""
+    carrier_mode_ok = [
+        (f.encode(f.FrameType.PONG, 0, b"token"), 0),
+        (f.encode(f.FrameType.DATA, 7, b"x"), 7),
+        (f.encode(f.FrameType.WELCOME, 0), 0),
+    ]
+    from mtproxy_bridge.web.carriers import WsLanesCarrier
+
+    carrier = object.__new__(
+        WsLanesCarrier
+    )  # без инициализации: тестируем только хелпер
+    for batch, lane_id in carrier_mode_ok:
+        assert carrier._reject_cross_lane(batch, lane_id) is None
+
+    # Битый батч проверка пропускает — формой займётся _on_inbound.
+    assert carrier._reject_cross_lane(b"\xff", 1) is None
+    with pytest.raises(CarrierFailure):
+        carrier._reject_cross_lane(f.encode(f.FrameType.DATA, 9, b"x"), 1)
