@@ -27,7 +27,7 @@ import sys
 from typing import TYPE_CHECKING
 
 from .config import BridgeConfig
-from .links import parse_tg_link, parse_web_link
+from .links import is_web_proxy_link, parse_tg_link, parse_web_link
 from .obfuscated2 import TAG_ABRIDGED, TAG_PADDED_INTERMEDIATE
 from .server import run_bridge
 
@@ -196,11 +196,10 @@ def main() -> None:
     )
 
     tunnel: WebTunnel | None = None
-    if (
-        args.tg_link.strip()
-        .lower()
-        .startswith(("tg://webproxy", "https://t.me/webproxy"))
-    ):
+    # Единый источник правды о типе ссылки — is_web_proxy_link: диспетчер
+    # обязан соглашаться с библиотечным API start_local_bridge(), иначе
+    # t.me/webproxy-ссылки падают в classic-путь и умирают на разборе.
+    if is_web_proxy_link(args.tg_link):
         web_link = parse_web_link(args.tg_link)
         cfg = BridgeConfig(
             listen_host=args.listen_host,

@@ -48,7 +48,13 @@ from typing import NamedTuple
 
 from .config import UPSTREAM_CONNECT_TIMEOUT_SECS
 from .faketls import async_faketls_handshake
-from .links import ProxyLink, WebProxyLink, parse_tg_link, parse_web_link
+from .links import (
+    ProxyLink,
+    WebProxyLink,
+    is_web_proxy_link,
+    parse_tg_link,
+    parse_web_link,
+)
 from .obfuscated2 import (
     TAG_ABRIDGED,
     TAG_PADDED_INTERMEDIATE,
@@ -668,7 +674,9 @@ async def check_link(
         :class:`CheckResult` with stages, timings and failure reason.
     """
     started = time.monotonic()
-    is_web = link.strip().lower().startswith(("tg://webproxy", "https://t.me/webproxy"))
+    # Тот же предикат, что и в cli.py / start_local_bridge: расхождение
+    # между двумя копиями уже ломал check для t.me/webproxy-ссылок.
+    is_web = is_web_proxy_link(link)
 
     parse_error: str | None = None
     parsed_link: ProxyLink | WebProxyLink | None = None
