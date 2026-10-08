@@ -241,18 +241,22 @@ class _FrameReader:
         if self._tag == TAG_PADDED_INTERMEDIATE:
             # IntermediateTransport::read_from_stream: uint32 LE длина payload;
             # старший бит = quick-ack (в этом сценарии пропускаем как nop).
-            if len(buf) < 4:
-                return None
-            size = struct.unpack_from("<I", buf, 0)[0]
-            if size & 0x80000000:
+            # TDLib после съеденного quick-ack сразу крутит цикл по тому же
+            # буферу (RawConnection.cpp:163-178: on_quick_ack → continue),
+            # поэтому None здесь означает только «в буфере меньше 4 байт».
+            while True:
+                if len(buf) < 4:
+                    return None
+                size = struct.unpack_from("<I", buf, 0)[0]
+                if size & 0x80000000:
+                    del buf[:4]
+                    continue
+                if len(buf) < 4 + size:
+                    return None
                 del buf[:4]
-                return None
-            if len(buf) < 4 + size:
-                return None
-            del buf[:4]
-            msg = bytes(buf[:size])
-            del buf[:size]
-            return msg
+                msg = bytes(buf[:size])
+                del buf[:size]
+                return msg
         # Abridged: 1 байт числа int'ов либо 0x7F + 3 байта LE (tdesktop V0).
         if not buf:
             return None

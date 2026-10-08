@@ -426,25 +426,12 @@ class TestFraming:
         reader.feed(frame(TAG_PADDED, payload, pad=0))
         assert reader.next_message() == payload
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "_FrameReader.next_message() после пропуска quick-ack слова возвращает None, "
-            "хотя в буфере уже целый фрейм; вызывающий код трактует None как «нужны ещё "
-            "данные». Нужен `continue` вместо `return None`. Малозначимо: на req_pq "
-            "(plain-пакет) quick-ack от DC не приходит. Снимите маркер после исправления."
-        ),
-    )
     def test_padded_quick_ack_followed_by_a_frame_in_one_chunk(self):
         reader = _FrameReader(TAG_PADDED)
         payload = os.urandom(16)
         reader.feed(struct.pack("<I", 0x80000001) + frame(TAG_PADDED, payload, pad=0))
         assert reader.next_message() == payload  # сразу, без нового feed()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Следствие бага выше на уровне check_link (см. test_padded_quick_ack_*).",
-    )
     async def test_check_survives_quick_ack_glued_to_the_answer(self, proxy_factory):
         async def handler(conn):
             buf = bytearray()
