@@ -337,6 +337,42 @@ async def test_https_lanes_failure_reclaims_every_lane():
         await runner.cleanup()
 
 
+async def test_https_lanes_graceful_aclose_reclaims_every_lane():
+    """Штатное закрытие отдаёт лейны так же, как отказ — иначе sender'ы висят.
+
+    ``aclose`` будит ``lane.wake`` и отдаёт лейны страховкой. Без этого
+    graceful-путь https-lanes (в отличие от websocket-lanes, где сокеты
+    разбудит ``_teardown_transport``) оставлял sender'ов на ``lane.wake``
+    уже после ``tunnel.aclose()`` — и они жили бы до конца процесса
+    (проверено: 1 сессия, 2 стрима -> 4 живые lane-задачи и незапустевший
+    ``carrier._lanes``).
+    """
+    relay = _HostileRelay("pass", variant="http-lanes")
+    runner = await _serve(relay)
+    tunnel = None
+    try:
+        tunnel = await _open_session(relay, runner)
+        carrier = tunnel._carrier
+        assert carrier is not None
+        assert tunnel.carrier_mode == "https-lanes"
+        # Клиентский поток -> непулевой лейн со своим sender'ом.
+        await asyncio.wait_for(tunnel.open_stream(), timeout=10)
+        lane_tasks = [t for ln in carrier._lanes.values() for t in ln.tasks]
+        assert lane_tasks, "лейны не создались"
+        assert any(not t.done() for t in lane_tasks)
+
+        await tunnel.aclose()
+
+        assert await _wait_for(lambda: not carrier._lanes), "лейны не отданы"
+        assert carrier._lanes == {}
+        assert all(t.done() for t in lane_tasks), (
+            "лейн-задачи пережили штатное закрытие carrier'а"
+        )
+    finally:
+        await _close(tunnel)
+        await runner.cleanup()
+
+
 async def test_graceful_lane_close_resets_only_that_stream():
     """Контроль: штатный CLOSE лейна не должен валить родительский carrier."""
     relay = _HostileRelay("graceful-close")

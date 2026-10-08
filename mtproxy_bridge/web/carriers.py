@@ -309,8 +309,14 @@ class BaseCarrier:
             await asyncio.sleep(0.02)
         self._stopping = True
         self._wake_all()
+        self._wake_lanes()
         await self._cancel_tasks()
         await self._teardown_transport()
+        # Лейн-таски _cancel_tasks не отменяет, а у https-lanes нет сокетов,
+        # которые разбудили бы sender'ов: без отдачи лейнов они переживают
+        # aclose() до конца жизни процесса. forget_lane идемпотентен, поэтому
+        # лейн, который reader успел забыть сам, не страдает.
+        await self._cancel_lanes()
         self._drop_pending("shutdown")
 
     # ------------------------------------------------------------------
@@ -391,6 +397,9 @@ class BaseCarrier:
 
     async def _cancel_lanes(self) -> None:
         """Отдаёт ресурсы лейнов (нет-op для плоских режимов)."""
+
+    def _wake_lanes(self) -> None:
+        """Будит lane-ожидания (нет-op для плоских режимов)."""
 
     async def _fail(self, exc: BaseException) -> None:
         if self._failed_exc is not None or self._stopping:
@@ -694,6 +703,18 @@ class LaneBasedCarrier(BaseCarrier):
         for lane_id in list(self._lanes):
             with contextlib.suppress(Exception):
                 await self.forget_lane(lane_id)
+
+    def _wake_lanes(self) -> None:
+        """Будит lane-ожидания, чтобы они увидели ``_stopping``.
+
+        ``_wake_all`` будит только плоские события, а sender'ы lanes-режимов
+        висят на ``lane.wake``: без этого шага они не замечают остановку
+        никогда. У websocket-lanes эту работу случайно делал
+        ``_teardown_transport`` (закрытие сокетов будит reader'ов), у
+        https-lanes сокетов нет вовсе.
+        """
+        for lane in self._lanes.values():
+            lane.wake.set()
 
     def _has_pending(self) -> bool:
         """Есть ли неотправленные аплинк-байты (по всем лейнам)."""
