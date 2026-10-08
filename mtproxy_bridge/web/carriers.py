@@ -770,9 +770,19 @@ class WsLanesCarrier(LaneBasedCarrier):
                     raise CarrierFailure(
                         f"relay sent {msg.type.name.lower()} on lane socket"
                     )
-                if msg.data:
-                    await self._on_inbound(msg.data)
+                if not msg.data:
+                    raise CarrierFailure(
+                        "relay sent an empty binary message on a lane socket"
+                    )
+                await self._on_inbound(msg.data)
         except asyncio.CancelledError:
+            established = False
+            raise
+        except CarrierFailure:
+            # Нарушение контракта relay'ом — отказ родительского carrier'а
+            # (PROTOCOL.md:390-392: невалидное relay-сообщение на лейне
+            # трактуется как parent-carrier failure, а не как сброс потока).
+            # Upstream пусть _guarded донесёт это до _fail().
             established = False
             raise
         except Exception:
