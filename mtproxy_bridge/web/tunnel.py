@@ -117,8 +117,13 @@ class WebStream:
                 data = b"".join(self._rx)
                 self._rx.clear()
                 self._unacked_rx -= len(data)
-                with contextlib.suppress(Exception):
-                    await self._tunnel._return_window(self.stream_id, len(data))
+                try:
+                    with contextlib.suppress(Exception):
+                        await self._tunnel._return_window(self.stream_id, len(data))
+                except asyncio.CancelledError:
+                    self._rx.appendleft(data)
+                    self._unacked_rx += len(data)
+                    raise
                 return data
             if self._error is not None:
                 raise self._error
